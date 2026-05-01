@@ -1,0 +1,32 @@
+{
+  "-5163544733": {
+    "total_messages": 0,
+    "deleted_messages": 0,
+    "total_warns": 3,
+    "total_mutes": 3,
+    "total_bans": 1,
+    "total_reports": 1,
+    "new_members": 0,
+    "since": "01.05.2026"
+  },
+  "-1003599124848": {
+    "total_messages": 0,
+    "deleted_messages": 0,
+    "total_warns": 0,
+    "total_mutes": 0,
+    "total_bans": 0,
+    "total_reports": 0,
+    "new_members": 1,
+    "since": "01.05.2026"
+  },
+  "-1001443863969": {
+    "total_messages": 0,
+    "deleted_messages": 0,
+    "total_warns": 0,
+    "total_mutes": 0,
+    "total_bans": 0,
+    "total_reports": 0,
+    "new_members": 1,
+    "since": "01.05.2026"
+  }
+}
