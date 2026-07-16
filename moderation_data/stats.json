@@ -16,7 +16,7 @@
     "total_mutes": 0,
     "total_bans": 0,
     "total_reports": 0,
-    "new_members": 1,
+    "new_members": 316,
     "since": "01.05.2026"
   },
   "-1001443863969": {
@@ -26,7 +26,17 @@
     "total_mutes": 0,
     "total_bans": 0,
     "total_reports": 0,
-    "new_members": 1,
+    "new_members": 274,
     "since": "01.05.2026"
+  },
+  "-1003581179459": {
+    "total_messages": 0,
+    "deleted_messages": 25,
+    "total_warns": 8,
+    "total_mutes": 9,
+    "total_bans": 2,
+    "total_reports": 11,
+    "new_members": 24,
+    "since": "03.05.2026"
   }
 }
