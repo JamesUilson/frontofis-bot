@@ -54,6 +54,11 @@ CERTIFICATE_THRESHOLD = 0.86
 CERTIFICATE_TEMPLATE_PATH = str(BASE_DIR / "certificates" / "template.png")
 CERTIFICATE_VOLUNTEER_TEMPLATE_PATH = str(BASE_DIR / "certificates" / "template_volunteer.png")
 
+
+def volunteer_event_template_path(event_id: int) -> str:
+    """Har bir tadbir uchun alohida (ixtiyoriy) sertifikat shabloni fayli."""
+    return str(BASE_DIR / "certificates" / "volunteer_events" / f"{event_id}.png")
+
 # ── FRONT OFIS A'ZOLIGIGA RO'YXATDAN O'TISH ──────────────────────────────────
 # False bo'lsa — bot orqali ariza qabul qilinmaydi, "muddat tugadi" xabari chiqadi
 # (Google Forma orqali qabul qilinayotganda shu holatga qo'yiladi)
@@ -578,6 +583,8 @@ class Database:
             self.cursor.execute("ALTER TABLE volunteer_events ADD COLUMN event_code TEXT")
         if "open_mode" not in vol_cols:
             self.cursor.execute("ALTER TABLE volunteer_events ADD COLUMN open_mode INTEGER DEFAULT 0")
+        if "is_active" not in vol_cols:
+            self.cursor.execute("ALTER TABLE volunteer_events ADD COLUMN is_active INTEGER DEFAULT 1")
         self.cursor.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_volunteer_events_code ON volunteer_events(event_code)"
         )
@@ -727,6 +734,18 @@ class Database:
     def get_volunteer_event(self, event_id: int):
         self.cursor.execute("SELECT * FROM volunteer_events WHERE id=?", (event_id,))
         return self.cursor.fetchone()
+
+    def set_volunteer_event_active(self, event_id: int, active: bool):
+        self.cursor.execute(
+            "UPDATE volunteer_events SET is_active=? WHERE id=?", (1 if active else 0, event_id)
+        )
+        self.conn.commit()
+
+    def delete_volunteer_event(self, event_id: int):
+        # FK CASCADE bu ulanishda yoqilmagan (foreign_keys=OFF), shuning uchun qo'lda o'chiramiz
+        self.cursor.execute("DELETE FROM volunteer_participants WHERE event_id=?", (event_id,))
+        self.cursor.execute("DELETE FROM volunteer_events WHERE id=?", (event_id,))
+        self.conn.commit()
 
     def get_volunteer_event_by_code(self, code: str):
         """Foydalanuvchi kiritgan kod bo'yicha qidiradi. Eski (migratsiyadan oldingi)
@@ -1100,6 +1119,7 @@ class VolunteerState(StatesGroup):
     waiting_event_title = State()
     choosing_event_mode = State()
     waiting_participants_file = State()
+    waiting_event_template = State()
 
 class VolunteerCertState(StatesGroup):
     """Foydalanuvchi: volontyorlik sertifikatini olish."""
@@ -1739,6 +1759,13 @@ async def volunteer_cert_check(message: Message, state: FSMContext):
     if not event:
         await message.answer(f"❌ <b>{code}</b> kodli tadbir topilmadi.", reply_markup=main_menu, parse_mode=ParseMode.HTML)
         return
+    if not event["is_active"]:
+        await message.answer(
+            f"⏸ <b>{event['title']}</b> tadbiri uchun sertifikat berish vaqtincha to'xtatilgan.\n\n"
+            f"Keyinroq qaytadan urinib ko'ring.",
+            reply_markup=main_menu, parse_mode=ParseMode.HTML
+        )
+        return
 
     participant = db.get_volunteer_participant(event["id"], message.from_user.id)
     if not participant:
@@ -1770,9 +1797,11 @@ async def volunteer_cert_check(message: Message, state: FSMContext):
         user = db.get_user(message.from_user.id)
         full_name = user["full_name"] if user and user["full_name"] else message.from_user.full_name
 
+    per_event_template = volunteer_event_template_path(event["id"])
+    template_path = per_event_template if os.path.exists(per_event_template) else CERTIFICATE_VOLUNTEER_TEMPLATE_PATH
     cert_bytes = await generate_certificate(
         full_name, event["title"], 0, 0, cert_code,
-        template_path=CERTIFICATE_VOLUNTEER_TEMPLATE_PATH
+        template_path=template_path
     )
     if not cert_bytes:
         await message.answer(
@@ -2994,14 +3023,147 @@ async def admin_volunteer_events_list(callback: CallbackQuery):
     for e in events:
         cnt = db.get_volunteer_participant_count(e["id"])
         mode_icon = "🔓" if e["open_mode"] else "🔒"
-        text += f"{mode_icon} <code>{e['event_code']}</code> — <b>{e['title']}</b> ({cnt} ishtirokchi)\n"
-        buttons.append([
-            InlineKeyboardButton(text=f"📤 {e['event_code']} yuklash", callback_data=f"admin_volunteer_upload_{e['id']}"),
-            InlineKeyboardButton(text=f"📥 {e['event_code']} Excel", callback_data=f"admin_volunteer_export_{e['id']}"),
-        ])
+        status_icon = "✅" if e["is_active"] else "⏸"
+        text += f"{status_icon}{mode_icon} <code>{e['event_code']}</code> — <b>{e['title']}</b> ({cnt} ishtirokchi)\n"
+        buttons.append([InlineKeyboardButton(
+            text=f"{status_icon} {e['event_code']} — {e['title'][:24]}",
+            callback_data=f"admin_volunteer_event_detail_{e['id']}"
+        )])
+    buttons.append([InlineKeyboardButton(text="➕ Tadbir yaratish", callback_data="admin_volunteer_create_event")])
     buttons.append([InlineKeyboardButton(text="⬅ Volontyorlik bo'limi", callback_data="admin_volunteer_menu")])
     await safe_edit(callback.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
     await callback.answer()
+
+
+async def _render_volunteer_event_detail(callback: CallbackQuery, event_id: int):
+    event = db.get_volunteer_event(event_id)
+    if not event:
+        await callback.answer("Tadbir topilmadi!", show_alert=True); return
+    cnt = db.get_volunteer_participant_count(event_id)
+    mode_label = "🔓 Ochiq (ID bilsa yetarli)" if event["open_mode"] else "🔒 Ro'yxat asosida"
+    status_label = "✅ Faol" if event["is_active"] else "⏸ Pauzada (sertifikat berilmaydi)"
+    has_own_template = os.path.exists(volunteer_event_template_path(event_id))
+    template_label = "✅ Shaxsiy shablon yuklangan" if has_own_template else "— Umumiy shablon ishlatiladi"
+
+    text = (
+        f"📋 <b>{event['title']}</b>\n{'─' * 30}\n"
+        f"🆔 ID: <code>{event['event_code']}</code>\n"
+        f"⚙️ Turi: {mode_label}\n"
+        f"📊 Holat: {status_label}\n"
+        f"👥 Ishtirokchilar: <b>{cnt}</b>\n"
+        f"🖼 Sertifikat shabloni: {template_label}"
+    )
+    toggle_text = "⏸ Pauza qilish" if event["is_active"] else "▶️ Faollashtirish"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📤 Qatnashchilar yuklash", callback_data=f"admin_volunteer_upload_{event_id}"),
+            InlineKeyboardButton(text="📥 Excel eksport", callback_data=f"admin_volunteer_export_{event_id}"),
+        ],
+        [InlineKeyboardButton(text="🖼 Shu tadbir uchun shablon", callback_data=f"admin_volunteer_event_template_{event_id}")],
+        [
+            InlineKeyboardButton(text=toggle_text, callback_data=f"admin_volunteer_toggle_{event_id}"),
+            InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"admin_volunteer_delete_{event_id}"),
+        ],
+        [InlineKeyboardButton(text="⬅ Tadbirlar ro'yxati", callback_data="admin_volunteer_events_list")],
+    ])
+    await safe_edit(callback.message, text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("admin_volunteer_event_detail_"))
+async def admin_volunteer_event_detail(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
+    event_id = int(callback.data.split("_")[4])
+    await _render_volunteer_event_detail(callback, event_id)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_volunteer_toggle_"))
+async def admin_volunteer_toggle(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
+    event_id = int(callback.data.split("_")[3])
+    event = db.get_volunteer_event(event_id)
+    if not event:
+        await callback.answer("Tadbir topilmadi!", show_alert=True); return
+    db.set_volunteer_event_active(event_id, not event["is_active"])
+    msg = "⏸ Pauza qilindi!" if event["is_active"] else "▶️ Faollashtirildi!"
+    await callback.answer(msg, show_alert=True)
+    await _render_volunteer_event_detail(callback, event_id)
+
+
+@router.callback_query(F.data.startswith("admin_volunteer_delete_"))
+async def admin_volunteer_delete_ask(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
+    event_id = int(callback.data.split("_")[3])
+    event = db.get_volunteer_event(event_id)
+    if not event:
+        await callback.answer("Tadbir topilmadi!", show_alert=True); return
+    cnt = db.get_volunteer_participant_count(event_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"admin_volunteer_confirm_delete_{event_id}"),
+        InlineKeyboardButton(text="❌ Bekor", callback_data=f"admin_volunteer_event_detail_{event_id}"),
+    ]])
+    await safe_edit(
+        callback.message,
+        f"⚠️ <b>'{event['title']}'</b> o'chirilsinmi?\n\n"
+        f"Bu tadbirning {cnt} ta ishtirokchisi ro'yxati ham butunlay o'chib ketadi!",
+        reply_markup=kb
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_volunteer_confirm_delete_"))
+async def admin_volunteer_delete_do(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
+    event_id = int(callback.data.split("_")[4])
+    db.delete_volunteer_event(event_id)
+    await callback.answer("✅ O'chirildi!", show_alert=True)
+    await admin_volunteer_events_list(callback)
+
+
+@router.callback_query(F.data.startswith("admin_volunteer_event_template_"))
+async def admin_volunteer_event_template_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
+    event_id = int(callback.data.split("_")[4])
+    event = db.get_volunteer_event(event_id)
+    if not event:
+        await callback.answer("Tadbir topilmadi!", show_alert=True); return
+    await state.update_data(vol_template_event_id=event_id)
+    await state.set_state(VolunteerState.waiting_event_template)
+    await callback.message.answer(
+        f"🖼 <b>'{event['title']}'</b> uchun sertifikat shablonini rasm ko'rinishida yuboring.\n\n"
+        "<i>Bu faqat shu tadbir uchun ishlatiladi. Yuklamasangiz, umumiy volontyorlik "
+        "shabloni ishlatiladi. Koordinatalar o'zgarmaydi.</i>",
+        reply_markup=cancel_kb, parse_mode=ParseMode.HTML
+    )
+    await callback.answer()
+
+
+@router.message(VolunteerState.waiting_event_template, F.photo, F.chat.type == "private")
+async def admin_volunteer_event_template_save(message: Message, state: FSMContext, bot: Bot):
+    if not is_admin(message.from_user.id): return
+    data = await state.get_data()
+    event_id = data.get("vol_template_event_id")
+    path = volunteer_event_template_path(event_id)
+    file = await bot.get_file(message.photo[-1].file_id)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    await bot.download_file(file.file_path, destination=path)
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅ Tadbirga qaytish", callback_data=f"admin_volunteer_event_detail_{event_id}")]
+    ])
+    await message.answer("✅ Shu tadbir uchun shaxsiy sertifikat shabloni yuklandi!", reply_markup=kb)
+
+
+@router.message(VolunteerState.waiting_event_template, F.chat.type == "private")
+async def admin_volunteer_event_template_invalid(message: Message, state: FSMContext):
+    if message.text == "❌ Bekor qilish":
+        await state.clear(); await message.answer("Bekor.", reply_markup=main_menu); return
+    await message.answer("❗ Iltimos, rasm (foto) ko'rinishida yuboring.")
 
 
 @router.callback_query(F.data.startswith("admin_volunteer_upload_"))
@@ -3016,8 +3178,10 @@ async def admin_volunteer_upload_start(callback: CallbackQuery, state: FSMContex
     await state.set_state(VolunteerState.waiting_participants_file)
     await callback.message.answer(
         f"📤 <b>'{event['title']}'</b> uchun tasdiqlangan ishtirokchilar ro'yxatini yuboring.\n\n"
-        "Excel ustunlari (1-qator sarlavha):\n<b>F.I.O | Telefon</b>\n\n"
-        "<i>Telefon raqami bo'yicha ishtirokchi avtomatik Telegram hisobiga bog'lanadi.</i>",
+        "Excel ustunlari (1-qator sarlavha):\n<b>F.I.O | Telefon | Telegram ID</b>\n\n"
+        "<i>Telefon va Telegram ID — ikkalasi ham ixtiyoriy, lekin kamida bittasi to'ldirilishi kerak. "
+        "Telegram ID kiritilsa, u to'g'ridan-to'g'ri ishlatiladi; bo'sh bo'lsa, telefon raqami "
+        "bo'yicha avtomatik qidiriladi.</i>",
         reply_markup=cancel_kb, parse_mode=ParseMode.HTML
     )
     await callback.answer()
@@ -3045,7 +3209,17 @@ async def admin_volunteer_upload_file(message: Message, state: FSMContext, bot: 
             continue
         full_name = str(row[0]).strip()
         phone = str(row[1]).strip() if len(row) > 1 and row[1] else ""
-        user_id = db.find_user_id_by_phone(phone) if phone else None
+        raw_tg_id = row[2] if len(row) > 2 else None
+
+        user_id = None
+        if raw_tg_id not in (None, ""):
+            try:
+                user_id = int(raw_tg_id)
+            except (ValueError, TypeError):
+                user_id = None
+        if user_id is None and phone:
+            user_id = db.find_user_id_by_phone(phone)
+
         if user_id:
             matched += 1
         else:
@@ -3058,15 +3232,26 @@ async def admin_volunteer_upload_file(message: Message, state: FSMContext, bot: 
 
     added = db.add_volunteer_participants(event_id, rows)
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅ Tadbirlar ro'yxati", callback_data="admin_volunteer_events_list")],
+        [InlineKeyboardButton(text="⬅ Tadbirga qaytish", callback_data=f"admin_volunteer_event_detail_{event_id}")],
     ])
-    await message.answer(
+    report = (
         f"✅ <b>Yuklandi!</b>\n\n"
         f"➕ Qo'shildi: <b>{added}</b> ta\n"
         f"✅ Telegram bilan bog'landi: <b>{matched}</b> ta\n"
-        f"⚠️ Bog'lanmadi: <b>{unmatched}</b> ta",
-        reply_markup=kb, parse_mode=ParseMode.HTML
+        f"⚠️ Bog'lanmadi: <b>{unmatched}</b> ta"
     )
+    unmatched_rows = [r for r in rows if not r.get("user_id")]
+    if unmatched_rows:
+        report += "\n\n⚠️ <b>Bog'lanmaganlar</b> (F.I.O — telefon):\n"
+        for r in unmatched_rows[:15]:
+            report += f"  • {r['full_name']} — {r['phone'] or '—'}\n"
+        if len(unmatched_rows) > 15:
+            report += f"  ... yana {len(unmatched_rows) - 15} ta\n"
+        report += (
+            "\n<i>Sabab: telefon raqami botga hech qachon yuborilmagan yoki noto'g'ri formatda. "
+            "Telegram ID ustunini to'ldirib qayta yuklashingiz mumkin.</i>"
+        )
+    await message.answer(report, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
 @router.message(VolunteerState.waiting_participants_file, F.chat.type == "private")
