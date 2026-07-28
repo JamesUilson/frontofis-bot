@@ -53,12 +53,6 @@ REQUIRED_CHANNELS = ["@YoshlarFrontOfisi", "@BaxaTech2025"]
 
 CERTIFICATE_THRESHOLD = 0.86
 CERTIFICATE_TEMPLATE_PATH = str(BASE_DIR / "certificates" / "template.png")
-CERTIFICATE_VOLUNTEER_TEMPLATE_PATH = str(BASE_DIR / "certificates" / "template_volunteer.png")
-
-
-def volunteer_event_template_path(event_id: int) -> str:
-    """Har bir tadbir uchun alohida (ixtiyoriy) sertifikat shabloni fayli."""
-    return str(BASE_DIR / "certificates" / "volunteer_events" / f"{event_id}.png")
 
 # ── A'ZOLIK GUVOHNOMASI (ID-karta) ───────────────────────────────────────────
 GUV_FRONT_PATH = str(BASE_DIR / "certificates" / "guvohnoma_old.png")
@@ -107,17 +101,6 @@ _GUV_REGION_ALIASES = {
     "qoraqalpogiston": "14", "qoraqalpogiston respublikasi": "14",
     "qoraqalpogiston res": "14", "karakalpakstan": "14", "nukus": "14",
 }
-
-# ── FRONT OFIS A'ZOLIGIGA RO'YXATDAN O'TISH ──────────────────────────────────
-# False bo'lsa — bot orqali ariza qabul qilinmaydi, "muddat tugadi" xabari chiqadi
-# (Google Forma orqali qabul qilinayotganda shu holatga qo'yiladi)
-FRONT_REGISTRATION_OPEN = False
-FRONT_REGISTRATION_CLOSED_MSG = (
-    "⛔ <b>Ro'yxatdan o'tish muddati tugagan!</b>\n\n"
-    "Front ofis a'zoligiga ariza botdagi shakl orqali endi qabul qilinmaydi.\n"
-    "Ariza topshirish uchun rasmiy Google Forma orqali murojaat qiling — "
-    "havola tez orada ushbu bot kanalida e'lon qilinadi."
-)
 
 # =============================================================================
 # MODERATSIYA SOZLAMALARI
@@ -592,51 +575,6 @@ class Database:
                 registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Viloyat nomi -> guruh chat_id bog'lanishi (/set_region orqali sozlanadi)
-        self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS region_groups (
-                region TEXT PRIMARY KEY,
-                chat_id INTEGER NOT NULL,
-                chat_title TEXT,
-                invite_link TEXT,
-                set_by INTEGER,
-                set_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        # Volontyorlik tadbirlari va tasdiqlangan ishtirokchilari
-        self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS volunteer_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                created_by INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS volunteer_participants (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id INTEGER NOT NULL,
-                user_id INTEGER,
-                full_name TEXT,
-                phone TEXT,
-                cert_issued INTEGER DEFAULT 0,
-                cert_code TEXT,
-                issued_at TIMESTAMP,
-                UNIQUE(event_id, user_id),
-                FOREIGN KEY (event_id) REFERENCES volunteer_events(id) ON DELETE CASCADE
-            )
-        """)
-        # Migration: event_code (ochiq/aralash ID) va open_mode ustunlari (eski DB uchun)
-        vol_cols = [row[1] for row in self.cursor.execute("PRAGMA table_info(volunteer_events)").fetchall()]
-        if "event_code" not in vol_cols:
-            self.cursor.execute("ALTER TABLE volunteer_events ADD COLUMN event_code TEXT")
-        if "open_mode" not in vol_cols:
-            self.cursor.execute("ALTER TABLE volunteer_events ADD COLUMN open_mode INTEGER DEFAULT 0")
-        if "is_active" not in vol_cols:
-            self.cursor.execute("ALTER TABLE volunteer_events ADD COLUMN is_active INTEGER DEFAULT 1")
-        self.cursor.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_volunteer_events_code ON volunteer_events(event_code)"
-        )
         # Admin yuklaydigan tasdiqlangan a'zolar ro'yxati (guvohnoma olish huquqi)
         self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS approved_members (
@@ -653,18 +591,10 @@ class Database:
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Migration: Excel'dan qo'lda beriladigan ID raqami (oxirgi 4 xona)
-        appr_cols = [r[1] for r in self.cursor.execute(
-            "PRAGMA table_info(approved_members)").fetchall()]
-        if "card_no" not in appr_cols:
-            self.cursor.execute(
-                "ALTER TABLE approved_members ADD COLUMN card_no TEXT")
         self.cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_appr_tg ON approved_members(tg_id)")
         self.cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_appr_ph ON approved_members(phone_key)")
-        self.cursor.execute(
-            "CREATE INDEX IF NOT EXISTS idx_appr_no ON approved_members(card_no)")
         # Berilgan a'zolik guvohnomalari
         self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS membership_cards (
@@ -687,20 +617,10 @@ class Database:
         self.cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_card_user ON membership_cards(user_id)")
         self.conn.commit()
-        self.conn.commit()
-        # Oldin yaratilgan (event_code hali yo'q) tadbirlarga kod biriktirish
-        self.cursor.execute("SELECT id FROM volunteer_events WHERE event_code IS NULL")
-        for row in self.cursor.fetchall():
-            self.cursor.execute(
-                "UPDATE volunteer_events SET event_code=? WHERE id=?",
-                (self._generate_unique_event_code(), row["id"])
-            )
-        self.conn.commit()
 
     # ── GUVOHNOMA: TASDIQLANGAN A'ZOLAR RO'YXATI ─────────────────────────
     def upsert_approved_member(self, tg_id, phone_key, phone, last_name,
-                               first_name, middle_name, region, position, added_by,
-                               card_no=None):
+                               first_name, middle_name, region, position, added_by):
         row = None
         if tg_id:
             self.cursor.execute(
@@ -716,54 +636,23 @@ class Database:
                        phone_key=COALESCE(?, phone_key), phone=COALESCE(?, phone),
                        last_name=COALESCE(?, last_name), first_name=COALESCE(?, first_name),
                        middle_name=COALESCE(?, middle_name), region=COALESCE(?, region),
-                       position=COALESCE(?, position), card_no=COALESCE(?, card_no)
+                       position=COALESCE(?, position)
                    WHERE id=?""",
                 (tg_id, phone_key, phone, last_name, first_name,
-                 middle_name, region, position, card_no, row["id"])
+                 middle_name, region, position, row["id"])
             )
             self.conn.commit()
             return "updated"
         self.cursor.execute(
             """INSERT INTO approved_members
                (tg_id, phone_key, phone, last_name, first_name, middle_name,
-                region, position, added_by, card_no)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                region, position, added_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (tg_id, phone_key, phone, last_name, first_name, middle_name,
-             region, position, added_by, card_no)
+             region, position, added_by)
         )
         self.conn.commit()
         return "added"
-
-    def find_approved_row_id(self, tg_id, phone_key):
-        """Yuklashda mavjud yozuvni topadi (dublikat tekshiruvidan chiqarish uchun)."""
-        if tg_id:
-            self.cursor.execute(
-                "SELECT id FROM approved_members WHERE tg_id=?", (tg_id,))
-            row = self.cursor.fetchone()
-            if row:
-                return row["id"]
-        if phone_key:
-            self.cursor.execute(
-                "SELECT id FROM approved_members WHERE phone_key=?", (phone_key,))
-            row = self.cursor.fetchone()
-            if row:
-                return row["id"]
-        return None
-
-    def approved_card_no_owner(self, card_no: str, region: str, exclude_id=None):
-        """Shu hududda shu ID raqami allaqachon band bo'lsa — egasini qaytaradi."""
-        if not card_no:
-            return None
-        sql = "SELECT * FROM approved_members WHERE card_no=?"
-        args = [card_no]
-        if region:
-            sql += " AND region=?"
-            args.append(region)
-        if exclude_id:
-            sql += " AND id!=?"
-            args.append(exclude_id)
-        self.cursor.execute(sql + " LIMIT 1", tuple(args))
-        return self.cursor.fetchone()
 
     def find_approved_by_tg(self, tg_id: int):
         self.cursor.execute("SELECT * FROM approved_members WHERE tg_id=?", (tg_id,))
@@ -882,177 +771,6 @@ class Database:
     def is_front_member(self, user_id: int) -> bool:
         self.cursor.execute("SELECT 1 FROM front_members WHERE user_id=?", (user_id,))
         return self.cursor.fetchone() is not None
-
-    @staticmethod
-    def _normalize_phone(phone: str) -> str:
-        return "".join(ch for ch in (phone or "") if ch.isdigit())
-
-    def find_user_id_by_phone(self, phone: str):
-        """Telefon raqami bo'yicha mavjud Telegram foydalanuvchisini topadi
-        (avval users, keyin front_members jadvalidan qidiradi)."""
-        digits = self._normalize_phone(phone)
-        if not digits:
-            return None
-        self.cursor.execute("SELECT id, phone FROM users WHERE phone IS NOT NULL AND phone != ''")
-        for row in self.cursor.fetchall():
-            if self._normalize_phone(row["phone"]) == digits:
-                return row["id"]
-        self.cursor.execute(
-            "SELECT user_id, phone FROM front_members WHERE phone IS NOT NULL AND phone != ''"
-        )
-        for row in self.cursor.fetchall():
-            if self._normalize_phone(row["phone"]) == digits:
-                return row["user_id"]
-        return None
-
-    def replace_front_members(self, rows: list):
-        """front_members jadvalini yangi ro'yxat bilan butunlay almashtiradi.
-        Har bir `rows` elementi dict: full_name, age, age_category, phone,
-        region, district, workplace, user_id (None bo'lishi mumkin)."""
-        try:
-            self.cursor.execute("BEGIN")
-            self.cursor.execute("DELETE FROM front_members")
-            for r in rows:
-                self.cursor.execute(
-                    """INSERT INTO front_members
-                       (user_id, full_name, age, age_category, phone, region,
-                        district, workplace, photo_file_id)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        r.get("user_id"), r.get("full_name"), r.get("age"),
-                        r.get("age_category"), r.get("phone"), r.get("region"),
-                        r.get("district"), r.get("workplace"), None
-                    )
-                )
-            self.conn.commit()
-        except Exception:
-            self.conn.rollback()
-            raise
-
-    # ── VILOYAT GURUHLARI ─────────────────────────────────────────────────
-    def set_region_group(self, region: str, chat_id: int, chat_title: str,
-                          invite_link: str, set_by: int):
-        self.cursor.execute(
-            """INSERT INTO region_groups (region, chat_id, chat_title, invite_link, set_by, set_at)
-               VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-               ON CONFLICT(region) DO UPDATE SET
-                 chat_id=excluded.chat_id, chat_title=excluded.chat_title,
-                 invite_link=excluded.invite_link, set_by=excluded.set_by,
-                 set_at=CURRENT_TIMESTAMP""",
-            (region, chat_id, chat_title, invite_link, set_by)
-        )
-        self.conn.commit()
-
-    def get_region_group(self, region: str):
-        self.cursor.execute("SELECT * FROM region_groups WHERE region=?", (region,))
-        return self.cursor.fetchone()
-
-    def get_all_region_groups(self):
-        self.cursor.execute("SELECT * FROM region_groups ORDER BY region")
-        return self.cursor.fetchall()
-
-    # ── VOLONTYORLIK TADBIRLARI ────────────────────────────────────────────
-    _EVENT_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # 0/O, 1/I/L kabi chalkash belgilarsiz
-
-    def _generate_unique_event_code(self, length: int = 5) -> str:
-        while True:
-            code = "".join(random.choices(self._EVENT_CODE_ALPHABET, k=length))
-            self.cursor.execute("SELECT 1 FROM volunteer_events WHERE event_code=?", (code,))
-            if not self.cursor.fetchone():
-                return code
-
-    def create_volunteer_event(self, title: str, created_by: int, open_mode: bool = False):
-        code = self._generate_unique_event_code()
-        self.cursor.execute(
-            "INSERT INTO volunteer_events (title, created_by, event_code, open_mode) VALUES (?, ?, ?, ?)",
-            (title, created_by, code, 1 if open_mode else 0)
-        )
-        self.conn.commit()
-        return self.cursor.lastrowid, code
-
-    def get_volunteer_event(self, event_id: int):
-        self.cursor.execute("SELECT * FROM volunteer_events WHERE id=?", (event_id,))
-        return self.cursor.fetchone()
-
-    def set_volunteer_event_active(self, event_id: int, active: bool):
-        self.cursor.execute(
-            "UPDATE volunteer_events SET is_active=? WHERE id=?", (1 if active else 0, event_id)
-        )
-        self.conn.commit()
-
-    def delete_volunteer_event(self, event_id: int):
-        # FK CASCADE bu ulanishda yoqilmagan (foreign_keys=OFF), shuning uchun qo'lda o'chiramiz
-        self.cursor.execute("DELETE FROM volunteer_participants WHERE event_id=?", (event_id,))
-        self.cursor.execute("DELETE FROM volunteer_events WHERE id=?", (event_id,))
-        self.conn.commit()
-
-    def get_volunteer_event_by_code(self, code: str):
-        """Foydalanuvchi kiritgan kod bo'yicha qidiradi. Eski (migratsiyadan oldingi)
-        raqamli ID orqali ham qidirish uchun zaxira variant saqlanadi."""
-        code = (code or "").strip().upper()
-        if not code:
-            return None
-        self.cursor.execute("SELECT * FROM volunteer_events WHERE event_code=?", (code,))
-        row = self.cursor.fetchone()
-        if row:
-            return row
-        if code.isdigit():
-            self.cursor.execute("SELECT * FROM volunteer_events WHERE id=?", (int(code),))
-            return self.cursor.fetchone()
-        return None
-
-    def get_all_volunteer_events(self):
-        self.cursor.execute("SELECT * FROM volunteer_events ORDER BY id DESC")
-        return self.cursor.fetchall()
-
-    def add_volunteer_participants(self, event_id: int, rows: list) -> int:
-        """rows: [{full_name, phone, user_id}]. Takrorlanganlarni (event_id, user_id)
-        bo'yicha o'tkazib yuboradi. Qo'shilgan qatorlar sonini qaytaradi."""
-        added = 0
-        for r in rows:
-            self.cursor.execute(
-                "INSERT OR IGNORE INTO volunteer_participants (event_id, user_id, full_name, phone) "
-                "VALUES (?, ?, ?, ?)",
-                (event_id, r.get("user_id"), r.get("full_name"), r.get("phone"))
-            )
-            added += self.cursor.rowcount
-        self.conn.commit()
-        return added
-
-    def get_volunteer_participant(self, event_id: int, user_id: int):
-        self.cursor.execute(
-            "SELECT * FROM volunteer_participants WHERE event_id=? AND user_id=?",
-            (event_id, user_id)
-        )
-        return self.cursor.fetchone()
-
-    def get_volunteer_participants(self, event_id: int):
-        self.cursor.execute(
-            "SELECT * FROM volunteer_participants WHERE event_id=? ORDER BY id", (event_id,)
-        )
-        return self.cursor.fetchall()
-
-    def get_volunteer_participant_count(self, event_id: int) -> int:
-        self.cursor.execute(
-            "SELECT COUNT(*) as cnt FROM volunteer_participants WHERE event_id=?", (event_id,)
-        )
-        return self.cursor.fetchone()["cnt"]
-
-    def mark_volunteer_cert_issued(self, participant_id: int, cert_code: str):
-        self.cursor.execute(
-            "UPDATE volunteer_participants SET cert_issued=1, cert_code=?, issued_at=CURRENT_TIMESTAMP "
-            "WHERE id=?",
-            (cert_code, participant_id)
-        )
-        self.conn.commit()
-
-    def get_volunteer_cert_by_code(self, cert_code: str):
-        self.cursor.execute(
-            "SELECT p.*, e.title as event_title FROM volunteer_participants p "
-            "JOIN volunteer_events e ON p.event_id = e.id WHERE p.cert_code=?",
-            (cert_code,)
-        )
-        return self.cursor.fetchone()
 
     def get_dynamic_admins(self):
         self.cursor.execute("SELECT * FROM dynamic_admins ORDER BY added_at")
@@ -1305,7 +1023,6 @@ class QuestionState(StatesGroup):
 
 class AdminState(StatesGroup):
     waiting_for_new_password = State()
-    waiting_for_new_admin_id = State()
 
 class AdminTestState(StatesGroup):
     creating_title = State()
@@ -1344,26 +1061,6 @@ class FrontOfisState(StatesGroup):
     waiting_workplace = State()
     waiting_photo = State()
 
-class BroadcastState(StatesGroup):
-    waiting_content = State()
-    confirming = State()
-
-class ImportFrontState(StatesGroup):
-    waiting_file = State()
-    confirming = State()
-
-class VolunteerState(StatesGroup):
-    """Admin: volontyorlik tadbirlarini boshqarish."""
-    waiting_template = State()
-    waiting_event_title = State()
-    choosing_event_mode = State()
-    waiting_participants_file = State()
-    waiting_event_template = State()
-
-class VolunteerCertState(StatesGroup):
-    """Foydalanuvchi: volontyorlik sertifikatini olish."""
-    waiting_event_id = State()
-
 class GuvState(StatesGroup):
     """A'zolik guvohnomasini olish bosqichlari."""
     waiting_phone = State()
@@ -1385,7 +1082,7 @@ main_menu = ReplyKeyboardMarkup(
         [KeyboardButton(text="📝 Testlar"), KeyboardButton(text="👤 Mening ma'lumotlarim")],
         [KeyboardButton(text="🏢 Front ofis a'zoligiga ariza")],
         [KeyboardButton(text="🪪 A'zolik guvohnomasi")],
-        [KeyboardButton(text="🔍 Sertifikat tekshirish"), KeyboardButton(text="🎗 Volontyorlik sertifikati")],
+        [KeyboardButton(text="🔍 Sertifikat tekshirish")],
         [KeyboardButton(text="❓ Loyiha haqida savol berish")],
         [KeyboardButton(text="🔐 Parolni tiklash"), KeyboardButton(text="🚨 Xabar berish")]
     ],
@@ -1526,17 +1223,16 @@ def _find_line_y(arr, W: int, H: int) -> int:
         return int(H * 0.504)
 
 
-async def generate_certificate(full_name, test_title, score, total, cert_code,
-                                template_path: str = CERTIFICATE_TEMPLATE_PATH) -> bytes | None:
+async def generate_certificate(full_name, test_title, score, total, cert_code) -> bytes | None:
     try:
         from PIL import Image, ImageDraw, ImageFont
         import qrcode as qrcode_lib
 
-        if not os.path.exists(template_path):
-            logging.warning("Sertifikat shabloni topilmadi: " + template_path)
+        if not os.path.exists(CERTIFICATE_TEMPLATE_PATH):
+            logging.warning("Sertifikat shabloni topilmadi: " + CERTIFICATE_TEMPLATE_PATH)
             return None
 
-        img = Image.open(template_path).convert("RGBA")
+        img = Image.open(CERTIFICATE_TEMPLATE_PATH).convert("RGBA")
         W, H = img.size
         overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
@@ -1660,52 +1356,6 @@ def guv_region_code(text: str) -> str | None:
         if alias in s and len(alias) > best_len:
             best, best_len = code, len(alias)
     return best
-
-
-def _row_get(row, key, default=None):
-    """sqlite3.Row dan xavfsiz o'qish (eski bazada ustun bo'lmasa ham ishlaydi)."""
-    try:
-        val = row[key]
-    except (IndexError, KeyError, TypeError):
-        return default
-    return default if val is None else val
-
-
-def guv_card_no(value) -> str | None:
-    """ID raqamining 4 xonali qismini normallashtiradi (4827, '827' -> '0827')."""
-    s = str(value if value is not None else "").strip()
-    if s.endswith(".0"):
-        s = s[:-2]
-    d = re.sub(r"\D", "", s)
-    if not d:
-        return None
-    if len(d) > 4:          # 6 xonali to'liq ID kiritilsa — oxirgi 4 xonasi
-        d = d[-4:]
-    return d.zfill(4)
-
-
-def guv_resolve_card_id(region_code: str, reserved_no: str | None,
-                        tg_id: int | None) -> tuple[str, str]:
-    """Guvohnoma ID sini aniqlaydi.
-
-    1) Excel'da ID raqami ko'rsatilgan bo'lsa — o'sha ishlatiladi
-    2) Bo'sh bo'lsa — Telegram ID sining oxirgi 4 raqami
-    3) Ikkisi ham band bo'lsa — tasodifiy raqam
-
-    Qaytaradi: (card_id, manba) — manba: "excel" | "telegram" | "random"
-    """
-    no = guv_card_no(reserved_no)
-    if no:
-        cid = f"{region_code}{no}"
-        if not db.card_id_exists(cid):
-            return cid, "excel"
-    if tg_id:
-        no = guv_card_no(str(tg_id)[-4:])
-        if no:
-            cid = f"{region_code}{no}"
-            if not db.card_id_exists(cid):
-                return cid, "telegram"
-    return guv_make_card_id(region_code), "random"
 
 
 def guv_make_card_id(region_code: str) -> str:
@@ -1981,39 +1631,25 @@ async def _show_guv_info(message: Message, card_id: str):
 
 async def _show_cert_info(message: Message, cert_code: str):
     # 6 xonali raqam — a'zolik guvohnomasi ID si
-    if re.fullmatch(r"\d{6}", (cert_code or "").strip()):
+    if re.fullmatch(r"\d{6}", cert_code.strip()):
         await _show_guv_info(message, cert_code.strip())
         return
     cert = db.get_cert_by_code(cert_code)
-    if cert:
-        pct = int(cert["score"] / cert["total"] * 100) if cert["total"] else 0
-        date_str = cert["finished_at"][:10] if cert["finished_at"] else "—"
+    if not cert:
         await message.answer(
-            f"✅ <b>Sertifikat haqiqiy!</b>\n\n"
-            f"👤 <b>Egasi:</b> {cert['user_name'] or '—'}\n"
-            f"📋 <b>Test:</b> {cert['title']}\n"
-            f"📊 <b>Natija:</b> {cert['score']}/{cert['total']} ({pct}%)\n"
-            f"📅 <b>Sana:</b> {date_str}\n"
-            f"🔖 <b>Raqam:</b> <code>{cert['cert_code']}</code>",
+            f"❌ <b>{cert_code}</b> raqamli sertifikat topilmadi.\n\nRaqamni tekshiring.",
             reply_markup=main_menu, parse_mode=ParseMode.HTML
         )
         return
-
-    vol_cert = db.get_volunteer_cert_by_code(cert_code)
-    if vol_cert:
-        date_str = (vol_cert["issued_at"] or "")[:10] or "—"
-        await message.answer(
-            f"✅ <b>Sertifikat haqiqiy!</b>\n\n"
-            f"👤 <b>Egasi:</b> {vol_cert['full_name'] or '—'}\n"
-            f"🎗 <b>Tadbir:</b> {vol_cert['event_title']}\n"
-            f"📅 <b>Sana:</b> {date_str}\n"
-            f"🔖 <b>Raqam:</b> <code>{vol_cert['cert_code']}</code>",
-            reply_markup=main_menu, parse_mode=ParseMode.HTML
-        )
-        return
-
+    pct = int(cert["score"] / cert["total"] * 100) if cert["total"] else 0
+    date_str = cert["finished_at"][:10] if cert["finished_at"] else "—"
     await message.answer(
-        f"❌ <b>{cert_code}</b> raqamli sertifikat topilmadi.\n\nRaqamni tekshiring.",
+        f"✅ <b>Sertifikat haqiqiy!</b>\n\n"
+        f"👤 <b>Egasi:</b> {cert['user_name'] or '—'}\n"
+        f"📋 <b>Test:</b> {cert['title']}\n"
+        f"📊 <b>Natija:</b> {cert['score']}/{cert['total']} ({pct}%)\n"
+        f"📅 <b>Sana:</b> {date_str}\n"
+        f"🔖 <b>Raqam:</b> <code>{cert['cert_code']}</code>",
         reply_markup=main_menu, parse_mode=ParseMode.HTML
     )
 
@@ -2238,93 +1874,6 @@ async def cert_check_code(message: Message, state: FSMContext):
 @router.message(CertCheckState.waiting_for_code, F.chat.type == "private")
 async def cert_check_code_invalid(message: Message):
     await message.answer("❗ Faqat sertifikat kodini matn ko'rinishida yuboring.")
-
-
-# =============================================================================
-# VOLONTYORLIK SERTIFIKATI
-# =============================================================================
-@router.message(F.text == "🎗 Volontyorlik sertifikati", F.chat.type == "private")
-async def volunteer_cert_start(message: Message, state: FSMContext):
-    await state.set_state(VolunteerCertState.waiting_event_id)
-    await message.answer(
-        "🎗 <b>Volontyorlik sertifikati</b>\n\n"
-        "Ishtirok etgan tadbiringizning <b>ID kodini</b> kiriting:",
-        reply_markup=cancel_kb, parse_mode=ParseMode.HTML
-    )
-
-
-@router.message(VolunteerCertState.waiting_event_id, F.chat.type == "private")
-async def volunteer_cert_check(message: Message, state: FSMContext):
-    if message.text == "❌ Bekor qilish":
-        await state.clear()
-        await message.answer("Bekor qilindi.", reply_markup=main_menu)
-        return
-    await state.clear()
-    code = message.text.strip()
-    event = db.get_volunteer_event_by_code(code)
-    if not event:
-        await message.answer(f"❌ <b>{code}</b> kodli tadbir topilmadi.", reply_markup=main_menu, parse_mode=ParseMode.HTML)
-        return
-    if not event["is_active"]:
-        await message.answer(
-            f"⏸ <b>{event['title']}</b> tadbiri uchun sertifikat berish vaqtincha to'xtatilgan.\n\n"
-            f"Keyinroq qaytadan urinib ko'ring.",
-            reply_markup=main_menu, parse_mode=ParseMode.HTML
-        )
-        return
-
-    participant = db.get_volunteer_participant(event["id"], message.from_user.id)
-    if not participant:
-        if event["open_mode"]:
-            user = db.get_user(message.from_user.id)
-            auto_name = user["full_name"] if user and user["full_name"] else message.from_user.full_name
-            db.add_volunteer_participants(
-                event["id"], [{"full_name": auto_name, "phone": None, "user_id": message.from_user.id}]
-            )
-            participant = db.get_volunteer_participant(event["id"], message.from_user.id)
-        else:
-            await message.answer(
-                f"❌ Siz <b>{event['title']}</b> tadbiri ishtirokchisi sifatida tasdiqlanmagansiz.\n\n"
-                f"Agar xato deb hisoblasangiz, tashkilotchilarga murojaat qiling.",
-                reply_markup=main_menu, parse_mode=ParseMode.HTML
-            )
-            return
-
-    if participant["cert_issued"] and participant["cert_code"]:
-        cert_code = participant["cert_code"]
-    else:
-        import uuid
-        raw = uuid.uuid4().hex[:8].upper()
-        cert_code = f"{raw[:4]}-{raw[4:]}"
-        db.mark_volunteer_cert_issued(participant["id"], cert_code)
-
-    full_name = participant["full_name"]
-    if not full_name:
-        user = db.get_user(message.from_user.id)
-        full_name = user["full_name"] if user and user["full_name"] else message.from_user.full_name
-
-    per_event_template = volunteer_event_template_path(event["id"])
-    template_path = per_event_template if os.path.exists(per_event_template) else CERTIFICATE_VOLUNTEER_TEMPLATE_PATH
-    cert_bytes = await generate_certificate(
-        full_name, event["title"], 0, 0, cert_code,
-        template_path=template_path
-    )
-    if not cert_bytes:
-        await message.answer(
-            "❗ Volontyorlik sertifikat shabloni hali yuklanmagan. Admin bilan bog'laning.",
-            reply_markup=main_menu
-        )
-        return
-
-    await message.answer_document(
-        BufferedInputFile(cert_bytes, filename=f"volontyorlik_sertifikat_{cert_code}.png"),
-        caption=(
-            f"🎗 <b>Volontyorlik sertifikati</b>\n\n"
-            f"📋 <b>Tadbir:</b> {event['title']}\n"
-            f"🔖 <b>Sertifikat raqami:</b> <code>{cert_code}</code>"
-        ),
-        reply_markup=main_menu, parse_mode=ParseMode.HTML
-    )
 
 
 # =============================================================================
@@ -2772,11 +2321,6 @@ async def _send_admin_panel(message: Message, edit: bool = False, user_id: int =
         ],
         [
             InlineKeyboardButton(text="📥 Excel (front ofis a'zolari)", callback_data="admin_export_front"),
-            InlineKeyboardButton(text="📤 Yangi a'zolar (Excel)", callback_data="admin_import_front"),
-        ],
-        [
-            InlineKeyboardButton(text="🗺 Viloyat guruhlari", callback_data="admin_region_groups"),
-            InlineKeyboardButton(text="🎗 Volontyorlik", callback_data="admin_volunteer_menu"),
         ],
         [
             InlineKeyboardButton(text="🪪 A'zolik guvohnomasi", callback_data="admin_guv"),
@@ -2830,9 +2374,17 @@ async def admin_front_stats(callback: CallbackQuery):
     await callback.answer()
 
 
-def _build_front_members_excel(members) -> io.BytesIO:
-    from openpyxl.styles import Font, Alignment
-    from openpyxl.utils import get_column_letter
+@router.callback_query(F.data == "admin_export_front")
+async def admin_export_front(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
+    await callback.answer("⏳ Excel tayyorlanmoqda...")
+
+    members = db.get_all_front_members()
+    if not members:
+        await callback.message.answer("📭 Hali front ofis a'zolari yo'q.")
+        return
+
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Front ofis a'zolari"
@@ -2843,6 +2395,10 @@ def _build_front_members_excel(members) -> io.BytesIO:
         "Ro'yxatdan o'tgan sana", "Telegram ID"
     ]
     ws.append(headers)
+
+    # Sarlavhalarni qalin qilish
+    from openpyxl.styles import Font, Alignment
+    from openpyxl.utils import get_column_letter
     bold_font = Font(bold=True)
     for cell in ws[1]:
         cell.font = bold_font
@@ -2862,6 +2418,7 @@ def _build_front_members_excel(members) -> io.BytesIO:
             m["user_id"] or ""
         ])
 
+    # Ustun kengliklarini sozlash
     widths = [5, 28, 6, 18, 16, 18, 20, 28, 18, 14]
     for col_idx, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(col_idx)].width = width
@@ -2869,1068 +2426,12 @@ def _build_front_members_excel(members) -> io.BytesIO:
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
-    return buf
 
-
-@router.callback_query(F.data == "admin_export_front")
-async def admin_export_front(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    await callback.answer("⏳ Excel tayyorlanmoqda...")
-
-    members = db.get_all_front_members()
-    if not members:
-        await callback.message.answer("📭 Hali front ofis a'zolari yo'q.")
-        return
-
-    buf = _build_front_members_excel(members)
     filename = f"front_ofis_azolari_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
     await callback.message.answer_document(
         BufferedInputFile(buf.read(), filename=filename),
         caption=f"🏢 <b>Front ofis a'zolari</b>\n\n👥 Jami: <b>{len(members)}</b> ta a'zo",
         parse_mode=ParseMode.HTML
-    )
-
-
-# ── KPI ───────────────────────────────────────────────────────────────────────
-@router.callback_query(F.data == "admin_kpi")
-async def admin_kpi(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    kpi = db.get_kpi_stats()
-    per_test = db.get_per_test_kpi()
-
-    text = (
-        f"📈 <b>KPI STATISTIKA</b>\n{'─' * 30}\n"
-        f"👥 Foydalanuvchilar: <b>{kpi['total_users']}</b>  |  Bugun: <b>+{kpi['today_users']}</b>\n"
-        f"🎯 Urinishlar: <b>{kpi['total_attempts']}</b>  |  Bugun: <b>{kpi['today_attempts']}</b>\n"
-        f"🏆 Sertifikatlar: <b>{kpi['total_certs']}</b>\n"
-        f"❌ Muvaffaqiyatsiz: <b>{kpi['total_failed']}</b>\n"
-        f"👤 Sertifikat olganlar (unik): <b>{kpi['cert_users']}</b>\n"
-        f"📊 O'rtacha ball: <b>{kpi['avg_score']}%</b>\n\n"
-    )
-    if per_test:
-        text += "📋 <b>Testlar bo'yicha:</b>\n"
-        for t in per_test:
-            avg = t["avg_pct"] if t["avg_pct"] is not None else 0
-            text += (
-                f"  • <b>{t['title']}</b>: {t['attempts']} urinish, "
-                f"✅{t['passed'] or 0} ❌{t['failed'] or 0}, o'rtacha {avg}%\n"
-            )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Admin", callback_data="admin_back")]
-    ])
-    await safe_edit(callback.message, text, reply_markup=kb)
-    await callback.answer()
-
-
-# ── NATIJALAR ─────────────────────────────────────────────────────────────────
-@router.callback_query(F.data == "admin_results")
-async def admin_results(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    results = db.get_results(limit=20)
-    text = f"📋 <b>SO'NGGI NATIJALAR</b> (oxirgi 20 ta)\n{'─' * 30}\n\n"
-    if not results:
-        text += "📭 Hali natijalar yo'q."
-    else:
-        for r in results:
-            status = "✅" if r["passed"] else "❌"
-            pct = round(r["score"] / r["total"] * 100) if r["total"] else 0
-            text += (
-                f"{status} {r['user_name'] or r['user_id']} — <b>{r['title']}</b>: "
-                f"{r['score']}/{r['total']} ({pct}%)\n"
-            )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Excel yuklab olish", callback_data="admin_export_results")],
-        [InlineKeyboardButton(text="⬅️ Admin", callback_data="admin_back")]
-    ])
-    await safe_edit(callback.message, text, reply_markup=kb)
-    await callback.answer()
-
-
-# ── TOP FOYDALANUVCHILAR ──────────────────────────────────────────────────────
-@router.callback_query(F.data == "admin_top_users")
-async def admin_top_users(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    top = db.get_top_users(10)
-    text = f"🏆 <b>TOP FOYDALANUVCHILAR</b>\n{'─' * 30}\n\n"
-    if not top:
-        text += "📭 Hali sertifikat olganlar yo'q."
-    else:
-        medals = ["🥇", "🥈", "🥉"]
-        for i, u in enumerate(top):
-            medal = medals[i] if i < 3 else f"{i + 1}."
-            text += f"{medal} {u['user_name'] or u['user_id']} — {u['certs']} ta sertifikat, o'rtacha {u['avg_pct']}%\n"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Admin", callback_data="admin_back")]
-    ])
-    await safe_edit(callback.message, text, reply_markup=kb)
-    await callback.answer()
-
-
-# ── EXCEL EKSPORTLAR ──────────────────────────────────────────────────────────
-def _build_results_excel(rows, title: str, only_passed: bool = False) -> io.BytesIO:
-    from openpyxl.styles import Font, Alignment
-    from openpyxl.utils import get_column_letter
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = title[:31]
-    headers = ["#", "Foydalanuvchi", "Test", "Ball", "Jami", "Foiz", "O'tdi", "Sertifikat kodi", "Sana"]
-    ws.append(headers)
-    bold_font = Font(bold=True)
-    for cell in ws[1]:
-        cell.font = bold_font
-        cell.alignment = Alignment(horizontal="center")
-    for i, r in enumerate(rows, start=1):
-        pct = round(r["score"] / r["total"] * 100, 1) if r["total"] else 0
-        ws.append([
-            i, r["user_name"] or r["user_id"], r["title"], r["score"], r["total"],
-            pct, "Ha" if r["passed"] else "Yo'q", r["cert_code"] or "",
-            (r["finished_at"] or "")[:16]
-        ])
-    widths = [5, 24, 24, 6, 6, 8, 8, 16, 18]
-    for col_idx, width in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf
-
-
-@router.callback_query(F.data == "admin_export_results")
-async def admin_export_results(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    await callback.answer("⏳ Excel tayyorlanmoqda...")
-    rows = db.get_results()
-    if not rows:
-        await callback.message.answer("📭 Hali natijalar yo'q."); return
-    buf = _build_results_excel(rows, "Barcha natijalar")
-    filename = f"natijalar_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-    await callback.message.answer_document(
-        BufferedInputFile(buf.read(), filename=filename),
-        caption=f"📊 <b>Barcha natijalar</b>\n\n🎯 Jami: <b>{len(rows)}</b> ta urinish",
-        parse_mode=ParseMode.HTML
-    )
-
-
-@router.callback_query(F.data == "admin_export_certs")
-async def admin_export_certs(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    await callback.answer("⏳ Excel tayyorlanmoqda...")
-    rows = db.get_passed_results()
-    if not rows:
-        await callback.message.answer("📭 Hali sertifikat olganlar yo'q."); return
-    buf = _build_results_excel(rows, "Sertifikatlar", only_passed=True)
-    filename = f"sertifikatlar_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-    await callback.message.answer_document(
-        BufferedInputFile(buf.read(), filename=filename),
-        caption=f"🏆 <b>Sertifikat olganlar</b>\n\n👥 Jami: <b>{len(rows)}</b> ta",
-        parse_mode=ParseMode.HTML
-    )
-
-
-@router.callback_query(F.data == "admin_export_users")
-async def admin_export_users(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    await callback.answer("⏳ Excel tayyorlanmoqda...")
-    users = db.get_all_users()
-    if not users:
-        await callback.message.answer("📭 Hali foydalanuvchilar yo'q."); return
-
-    from openpyxl.styles import Font, Alignment
-    from openpyxl.utils import get_column_letter
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Foydalanuvchilar"
-    headers = ["#", "Telegram ID", "F.I.O", "Username", "Telefon", "Viloyat", "Tug'ilgan yil", "Ro'yxatdan o'tgan sana"]
-    ws.append(headers)
-    bold_font = Font(bold=True)
-    for cell in ws[1]:
-        cell.font = bold_font
-        cell.alignment = Alignment(horizontal="center")
-    for i, u in enumerate(users, start=1):
-        ws.append([
-            i, u["id"], u["full_name"] or "", u["username"] or "", u["phone"] or "",
-            u["region"] or "", u["birth_year"] or "", (u["registered_at"] or "")[:16]
-        ])
-    widths = [5, 14, 24, 18, 16, 18, 12, 18]
-    for col_idx, width in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    filename = f"foydalanuvchilar_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-    await callback.message.answer_document(
-        BufferedInputFile(buf.read(), filename=filename),
-        caption=f"📋 <b>Barcha foydalanuvchilar</b>\n\n👥 Jami: <b>{len(users)}</b> ta",
-        parse_mode=ParseMode.HTML
-    )
-
-
-# ── SERTIFIKAT SHABLONI ────────────────────────────────────────────────────────
-@router.callback_query(F.data == "admin_certificate_template")
-async def admin_certificate_template_start(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    await state.set_state(AdminTestState.waiting_certificate)
-    await callback.message.answer(
-        "🖼 <b>Yangi sertifikat shablonini rasm (PNG/JPG) ko'rinishida yuboring.</b>\n\n"
-        "Bu rasm barcha yangi sertifikatlar uchun fon sifatida ishlatiladi.",
-        reply_markup=cancel_kb, parse_mode=ParseMode.HTML
-    )
-    await callback.answer()
-
-
-@router.message(AdminTestState.waiting_certificate, F.photo, F.chat.type == "private")
-async def admin_certificate_template_save(message: Message, state: FSMContext, bot: Bot):
-    if not is_admin(message.from_user.id): return
-    file = await bot.get_file(message.photo[-1].file_id)
-    Path(CERTIFICATE_TEMPLATE_PATH).parent.mkdir(parents=True, exist_ok=True)
-    await bot.download_file(file.file_path, destination=CERTIFICATE_TEMPLATE_PATH)
-    await state.clear()
-    await message.answer("✅ Sertifikat shabloni yangilandi!", reply_markup=main_menu)
-
-
-@router.message(AdminTestState.waiting_certificate, F.chat.type == "private")
-async def admin_certificate_template_invalid(message: Message, state: FSMContext):
-    if message.text == "❌ Bekor qilish":
-        await state.clear(); await message.answer("Bekor.", reply_markup=main_menu); return
-    await message.answer("❗ Iltimos, rasm (foto) ko'rinishida yuboring.")
-
-
-# ── ADMINLAR BOSHQARUVI ────────────────────────────────────────────────────────
-@router.callback_query(F.data == "admin_manage_admins")
-async def admin_manage_admins(callback: CallbackQuery):
-    if not is_superadmin(callback.from_user.id):
-        await callback.answer("❌ Faqat superadmin uchun!", show_alert=True); return
-    dynamic = db.get_dynamic_admins()
-    text = f"👮 <b>ADMINLAR BOSHQARUVI</b>\n{'─' * 30}\n\n"
-    text += f"👑 Superadmin: <code>{SUPERADMIN_ID}</code>\n"
-    for aid in ADMIN_IDS[1:]:
-        text += f"⭐ Asosiy admin: <code>{aid}</code>\n"
-    if dynamic:
-        text += "\n➕ <b>Qo'shilgan adminlar:</b>\n"
-        for row in dynamic:
-            text += f"  • <code>{row['user_id']}</code>\n"
-    else:
-        text += "\n📭 Qo'shimcha adminlar yo'q."
-
-    buttons = [[InlineKeyboardButton(text="➕ Admin qo'shish", callback_data="admin_add_admin")]]
-    for row in dynamic:
-        buttons.append([InlineKeyboardButton(
-            text=f"❌ {row['user_id']} ni o'chirish", callback_data=f"admin_rm_admin_{row['user_id']}"
-        )])
-    buttons.append([InlineKeyboardButton(text="⬅️ Admin", callback_data="admin_back")])
-    await safe_edit(callback.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await callback.answer()
-
-
-@router.callback_query(F.data == "admin_add_admin")
-async def admin_add_admin_start(callback: CallbackQuery, state: FSMContext):
-    if not is_superadmin(callback.from_user.id):
-        await callback.answer("❌ Faqat superadmin uchun!", show_alert=True); return
-    await state.set_state(AdminState.waiting_for_new_admin_id)
-    await callback.message.answer(
-        "🆔 Yangi adminning Telegram ID raqamini kiriting:", reply_markup=cancel_kb
-    )
-    await callback.answer()
-
-
-@router.message(AdminState.waiting_for_new_admin_id, F.chat.type == "private")
-async def admin_add_admin_save(message: Message, state: FSMContext):
-    if not is_superadmin(message.from_user.id): return
-    if message.text == "❌ Bekor qilish":
-        await state.clear(); await message.answer("Bekor.", reply_markup=main_menu); return
-    try:
-        new_id = int(message.text.strip())
-    except ValueError:
-        await message.answer("❗ Faqat raqam (Telegram ID) kiriting:"); return
-    db.add_dynamic_admin(new_id, message.from_user.id)
-    await state.clear()
-    await message.answer(f"✅ <code>{new_id}</code> admin qilib qo'shildi!", reply_markup=main_menu, parse_mode=ParseMode.HTML)
-
-
-@router.callback_query(F.data.startswith("admin_rm_admin_"))
-async def admin_remove_admin_cb(callback: CallbackQuery):
-    if not is_superadmin(callback.from_user.id):
-        await callback.answer("❌ Faqat superadmin uchun!", show_alert=True); return
-    target_id = int(callback.data.split("_")[3])
-    db.remove_dynamic_admin(target_id)
-    await callback.answer("✅ O'chirildi!", show_alert=True)
-    await admin_manage_admins(callback)
-
-
-# ── FRONT A'ZOLARNI EXCEL ORQALI ALMASHTIRISH ────────────────────────────────
-IMPORT_FRONT_HEADER_HINT = (
-    "📤 <b>Yangi front ofis a'zolari ro'yxatini yuklang.</b>\n\n"
-    "Excel eksport shabloni bilan bir xil tartibda bo'lsin (1-qator sarlavha):\n"
-    "<b>#, F.I.O, Yosh, Yosh toifasi, Telefon, Hudud, Tuman/Shahar, "
-    "O'qish/Ish joyi, Ro'yxatdan o'tgan sana, Telegram ID</b>\n\n"
-    "<i>\"Telegram ID\" ustuni bo'sh bo'lsa — foydalanuvchi telefon raqami "
-    "bo'yicha avtomatik aniqlanadi.</i>\n\n"
-    "⚠️ Yuklangach, <b>eski ro'yxat butunlay yangisi bilan almashtiriladi</b> "
-    "(eski ro'yxatning zaxira nusxasi avtomatik yuboriladi)."
-)
-
-
-@router.callback_query(F.data == "admin_import_front")
-async def admin_import_front_start(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    await state.set_state(ImportFrontState.waiting_file)
-    await callback.message.answer(IMPORT_FRONT_HEADER_HINT, reply_markup=cancel_kb, parse_mode=ParseMode.HTML)
-    await callback.answer()
-
-
-@router.message(ImportFrontState.waiting_file, F.document, F.chat.type == "private")
-async def admin_import_front_file(message: Message, state: FSMContext, bot: Bot):
-    if not is_admin(message.from_user.id): return
-
-    file = await bot.get_file(message.document.file_id)
-    buf = io.BytesIO()
-    await bot.download_file(file.file_path, destination=buf)
-    buf.seek(0)
-    try:
-        wb = openpyxl.load_workbook(buf)
-        ws = wb.active
-    except Exception:
-        await message.answer("❗ Fayl noto'g'ri formatda. Qaytadan .xlsx yuboring."); return
-
-    rows, matched, unmatched = [], 0, 0
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if not row or not any(row):
-            continue
-        full_name = str(row[1]).strip() if len(row) > 1 and row[1] else ""
-        if not full_name:
-            continue
-        age = row[2] if len(row) > 2 else None
-        age_category = str(row[3]).strip() if len(row) > 3 and row[3] else ""
-        phone = str(row[4]).strip() if len(row) > 4 and row[4] else ""
-        region = str(row[5]).strip() if len(row) > 5 and row[5] else ""
-        district = str(row[6]).strip() if len(row) > 6 and row[6] else ""
-        workplace = str(row[7]).strip() if len(row) > 7 and row[7] else ""
-        raw_tg_id = row[9] if len(row) > 9 else None
-
-        user_id = None
-        if raw_tg_id not in (None, ""):
-            try:
-                user_id = int(raw_tg_id)
-            except (ValueError, TypeError):
-                user_id = None
-        if user_id is None and phone:
-            user_id = db.find_user_id_by_phone(phone)
-
-        if user_id:
-            matched += 1
-        else:
-            unmatched += 1
-
-        rows.append({
-            "full_name": full_name, "age": age, "age_category": age_category,
-            "phone": phone, "region": region, "district": district,
-            "workplace": workplace, "user_id": user_id,
-        })
-
-    if not rows:
-        await message.answer("❗ Faylda hech qanday to'g'ri qator topilmadi."); return
-
-    await state.update_data(import_rows=rows)
-    await state.set_state(ImportFrontState.confirming)
-    old_count = db.get_front_member_count()
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Tasdiqlash va almashtirish", callback_data="admin_import_confirm")],
-        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin_import_cancel")],
-    ])
-    await message.answer(
-        f"📊 <b>Xulosa:</b>\n\n"
-        f"🗑 Eski ro'yxat (o'chadi): <b>{old_count}</b> ta\n"
-        f"➕ Yangi yuklanadigan: <b>{len(rows)}</b> ta\n"
-        f"✅ Telegram bilan bog'landi: <b>{matched}</b> ta\n"
-        f"⚠️ Bog'lanmadi (telefon mos kelmadi): <b>{unmatched}</b> ta\n\n"
-        f"Davom etsak, eski ro'yxatning zaxira nusxasi yuboriladi, so'ng almashtiriladi.",
-        reply_markup=kb, parse_mode=ParseMode.HTML
-    )
-
-
-@router.message(ImportFrontState.waiting_file, F.chat.type == "private")
-async def admin_import_front_invalid(message: Message, state: FSMContext):
-    if message.text == "❌ Bekor qilish":
-        await state.clear(); await message.answer("Bekor.", reply_markup=main_menu); return
-    await message.answer("❗ Iltimos, .xlsx fayl yuboring (hujjat ko'rinishida).")
-
-
-@router.callback_query(F.data == "admin_import_cancel", ImportFrontState.confirming)
-async def admin_import_front_cancel(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text("❌ Bekor qilindi. Eski ro'yxat o'zgarishsiz qoldi.")
-    await callback.answer()
-
-
-@router.callback_query(F.data == "admin_import_confirm", ImportFrontState.confirming)
-async def admin_import_front_confirm(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    data = await state.get_data()
-    rows = data.get("import_rows", [])
-    await state.clear()
-    await callback.answer("⏳ Almashtirilmoqda...")
-
-    old_members = db.get_all_front_members()
-    if old_members:
-        backup_buf = _build_front_members_excel(old_members)
-        await callback.message.answer_document(
-            BufferedInputFile(
-                backup_buf.read(),
-                filename=f"eski_front_azolari_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-            ),
-            caption="🗄 Eski ro'yxatning zaxira nusxasi (almashtirishdan oldin)."
-        )
-
-    db.replace_front_members(rows)
-    matched = sum(1 for r in rows if r.get("user_id"))
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📨 Guruh takliflarini yuborish", callback_data="admin_send_invites")],
-        [InlineKeyboardButton(text="⬅️ Admin", callback_data="admin_back")],
-    ])
-    await callback.message.answer(
-        f"✅ <b>Front ofis a'zolari yangilandi!</b>\n\n"
-        f"👥 Jami: <b>{len(rows)}</b> ta\n"
-        f"🔗 Telegram bilan bog'langan: <b>{matched}</b> ta",
-        reply_markup=kb, parse_mode=ParseMode.HTML
-    )
-
-
-# ── VILOYAT GURUHLARI (ADMIN PANEL) ──────────────────────────────────────────
-@router.callback_query(F.data == "admin_region_groups")
-async def admin_region_groups_view(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    configured = {row["region"]: row for row in db.get_all_region_groups()}
-    text = f"🗺 <b>VILOYAT GURUHLARI</b>\n{'─' * 30}\n\n"
-    for region in FRONT_REGIONS:
-        if region in configured:
-            title = configured[region]["chat_title"] or str(configured[region]["chat_id"])
-            text += f"✅ {region} — <code>{title}</code>\n"
-        else:
-            text += f"⛔ {region} — sozlanmagan\n"
-    text += (
-        "\n<i>Sozlash uchun: botni tegishli viloyat guruhiga admin (taklif qilish huquqi bilan) "
-        "qilib qo'shing va o'sha guruhda <code>/set_region Viloyat nomi</code> buyrug'ini yuboring.</i>"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📨 Guruh takliflarini yuborish", callback_data="admin_send_invites")],
-        [InlineKeyboardButton(text="⬅️ Admin", callback_data="admin_back")],
-    ])
-    await safe_edit(callback.message, text, reply_markup=kb)
-    await callback.answer()
-
-
-@router.callback_query(F.data == "admin_send_invites")
-async def admin_send_invites(callback: CallbackQuery, bot: Bot):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    await callback.answer()
-    members = db.get_all_front_members()
-    if not members:
-        await callback.message.answer("📭 Hali front ofis a'zolari yo'q."); return
-    status_msg = await callback.message.answer(f"⏳ Yuborilmoqda... 0/{len(members)}")
-
-    sent, failed, no_group, no_user = 0, 0, 0, 0
-    for i, m in enumerate(members, start=1):
-        if not m["user_id"]:
-            no_user += 1
-        else:
-            group = db.get_region_group(m["region"] or "")
-            if not group:
-                no_group += 1
-            else:
-                kb = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text=f"➡️ {m['region']} guruhiga qo'shilish", url=group["invite_link"])]
-                ])
-                try:
-                    await bot.send_message(
-                        m["user_id"],
-                        f"🏢 <b>Siz Front ofis a'zosisiz!</b>\n\n"
-                        f"🗺 Hudud: <b>{m['region']}</b>\n\n"
-                        f"Quyidagi tugma orqali o'z viloyat guruhingizga qo'shiling:",
-                        reply_markup=kb, parse_mode=ParseMode.HTML
-                    )
-                    sent += 1
-                except TelegramForbiddenError:
-                    failed += 1
-                except Exception as e:
-                    failed += 1
-                    logging.warning(f"Guruh taklifi xatosi ({m['user_id']}): {e}")
-        await asyncio.sleep(0.05)
-        if i % 25 == 0 or i == len(members):
-            try:
-                await status_msg.edit_text(f"⏳ Yuborilmoqda... {i}/{len(members)}")
-            except Exception:
-                pass
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Admin", callback_data="admin_back")]])
-    await status_msg.edit_text(
-        f"✅ <b>Guruh takliflari yuborildi!</b>\n\n"
-        f"📤 Yuborildi: <b>{sent}</b>\n"
-        f"⛔ Yuborilmadi (bloklagan/xato): <b>{failed}</b>\n"
-        f"🚫 Guruh sozlanmagan viloyat: <b>{no_group}</b>\n"
-        f"❓ Telegram bilan bog'lanmagan: <b>{no_user}</b>",
-        reply_markup=kb, parse_mode=ParseMode.HTML
-    )
-
-
-# ── VOLONTYORLIK TADBIRLARI (ADMIN) ──────────────────────────────────────────
-@router.callback_query(F.data == "admin_volunteer_menu")
-async def admin_volunteer_menu(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    events = db.get_all_volunteer_events()
-    text = f"🎗 <b>VOLONTYORLIK FAOLIYATI</b>\n{'─' * 30}\n\n"
-    text += f"📋 Jami tadbirlar: <b>{len(events)}</b>\n\n"
-    text += (
-        "Bu bo'lim orqali volontyorlik tadbirlari uchun alohida sertifikat "
-        "shabloni yuklaysiz, tadbir yaratasiz va tasdiqlangan ishtirokchilar "
-        "ro'yxatini (F.I.O + telefon) Excel orqali yuklaysiz. Ishtirokchi botda "
-        "tadbir ID sini kiritib, sertifikatini oladi."
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🖼 Sertifikat shabloni", callback_data="admin_volunteer_template")],
-        [InlineKeyboardButton(text="➕ Tadbir yaratish", callback_data="admin_volunteer_create_event")],
-        [InlineKeyboardButton(text="📋 Tadbirlar ro'yxati", callback_data="admin_volunteer_events_list")],
-        [InlineKeyboardButton(text="⬅️ Admin", callback_data="admin_back")],
-    ])
-    await safe_edit(callback.message, text, reply_markup=kb)
-    await callback.answer()
-
-
-@router.callback_query(F.data == "admin_volunteer_template")
-async def admin_volunteer_template_start(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    await state.set_state(VolunteerState.waiting_template)
-    await callback.message.answer(
-        "🖼 <b>Volontyorlik sertifikati shablonini rasm (PNG/JPG) ko'rinishida yuboring.</b>\n\n"
-        "<i>Ism va sertifikat raqami xuddi oldingi sertifikatdagi kabi joylashadi — "
-        "koordinatalar o'zgarmaydi.</i>",
-        reply_markup=cancel_kb, parse_mode=ParseMode.HTML
-    )
-    await callback.answer()
-
-
-@router.message(VolunteerState.waiting_template, F.photo, F.chat.type == "private")
-async def admin_volunteer_template_save(message: Message, state: FSMContext, bot: Bot):
-    if not is_admin(message.from_user.id): return
-    file = await bot.get_file(message.photo[-1].file_id)
-    Path(CERTIFICATE_VOLUNTEER_TEMPLATE_PATH).parent.mkdir(parents=True, exist_ok=True)
-    await bot.download_file(file.file_path, destination=CERTIFICATE_VOLUNTEER_TEMPLATE_PATH)
-    await state.clear()
-    await message.answer("✅ Volontyorlik sertifikat shabloni yangilandi!", reply_markup=main_menu)
-
-
-@router.message(VolunteerState.waiting_template, F.chat.type == "private")
-async def admin_volunteer_template_invalid(message: Message, state: FSMContext):
-    if message.text == "❌ Bekor qilish":
-        await state.clear(); await message.answer("Bekor.", reply_markup=main_menu); return
-    await message.answer("❗ Iltimos, rasm (foto) ko'rinishida yuboring.")
-
-
-@router.callback_query(F.data == "admin_volunteer_create_event")
-async def admin_volunteer_create_event_start(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    await state.set_state(VolunteerState.waiting_event_title)
-    await callback.message.answer(
-        "📝 <b>Yangi tadbir nomini kiriting:</b>\n<i>(masalan: \"Ko'chani tozalash aksiyasi\")</i>",
-        reply_markup=cancel_kb, parse_mode=ParseMode.HTML
-    )
-    await callback.answer()
-
-
-@router.message(VolunteerState.waiting_event_title, F.chat.type == "private")
-async def admin_volunteer_create_event_save(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    if message.text == "❌ Bekor qilish":
-        await state.clear(); await message.answer("Bekor.", reply_markup=main_menu); return
-    title = message.text.strip()
-    if len(title) < 3:
-        await message.answer("❗ Tadbir nomi juda qisqa. Qaytadan kiriting:"); return
-    await state.update_data(vol_new_title=title)
-    await state.set_state(VolunteerState.choosing_event_mode)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔒 Ro'yxat asosida (Excel)", callback_data="admin_volunteer_mode_roster")],
-        [InlineKeyboardButton(text="🔓 Ochiq (ID bilsa yetarli)", callback_data="admin_volunteer_mode_open")],
-    ])
-    await message.answer(
-        f"📋 <b>{title}</b>\n\nTadbir turini tanlang:\n\n"
-        "🔒 <b>Ro'yxat asosida</b> — faqat siz Excel orqali yuklagan tasdiqlangan "
-        "ishtirokchilar sertifikat oladi.\n\n"
-        "🔓 <b>Ochiq</b> — ID kodini bilgan har qanday foydalanuvchi sertifikat oladi "
-        "(ro'yxat yuklashga vaqt yo'q, shoshilinch tadbirlar uchun).",
-        reply_markup=kb, parse_mode=ParseMode.HTML
-    )
-
-
-@router.callback_query(
-    F.data.in_({"admin_volunteer_mode_roster", "admin_volunteer_mode_open"}),
-    VolunteerState.choosing_event_mode
-)
-async def admin_volunteer_create_event_finish(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    data = await state.get_data()
-    title = data.get("vol_new_title", "").strip()
-    await state.clear()
-    if not title:
-        await callback.answer("Xatolik: tadbir nomi topilmadi. Qaytadan urinib ko'ring.", show_alert=True)
-        return
-
-    open_mode = callback.data == "admin_volunteer_mode_open"
-    event_id, code = db.create_volunteer_event(title, callback.from_user.id, open_mode=open_mode)
-    mode_label = "🔓 Ochiq (ID bilsa yetarli)" if open_mode else "🔒 Ro'yxat asosida"
-
-    kb_rows = []
-    if not open_mode:
-        kb_rows.append([InlineKeyboardButton(
-            text="📤 Qatnashchilarni yuklash", callback_data=f"admin_volunteer_upload_{event_id}"
-        )])
-    kb_rows.append([InlineKeyboardButton(text="⬅ Volontyorlik bo'limi", callback_data="admin_volunteer_menu")])
-
-    extra_hint = (
-        "<i>Ishtirokchilarga shu ID kodni tarqating — botda kiritib, ro'yxatsiz sertifikat olishadi.</i>"
-        if open_mode else
-        "<i>Avval \"Qatnashchilarni yuklash\" orqali tasdiqlangan ro'yxatni yuklang, "
-        "keyin ID kodni ishtirokchilarga tarqating.</i>"
-    )
-    await callback.message.edit_text(
-        f"✅ <b>Tadbir yaratildi!</b>\n\n"
-        f"📋 <b>{title}</b>\n"
-        f"🆔 Tadbir ID: <code>{code}</code>\n"
-        f"⚙️ Turi: {mode_label}\n\n"
-        f"{extra_hint}",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows), parse_mode=ParseMode.HTML
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "admin_volunteer_events_list")
-async def admin_volunteer_events_list(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    events = db.get_all_volunteer_events()
-    if not events:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Tadbir yaratish", callback_data="admin_volunteer_create_event")],
-            [InlineKeyboardButton(text="⬅ Volontyorlik bo'limi", callback_data="admin_volunteer_menu")],
-        ])
-        await safe_edit(callback.message, "📭 Hali tadbirlar yo'q.", reply_markup=kb)
-        await callback.answer(); return
-
-    text = f"📋 <b>TADBIRLAR RO'YXATI</b>\n{'─' * 30}\n\n"
-    buttons = []
-    for e in events:
-        cnt = db.get_volunteer_participant_count(e["id"])
-        mode_icon = "🔓" if e["open_mode"] else "🔒"
-        status_icon = "✅" if e["is_active"] else "⏸"
-        text += f"{status_icon}{mode_icon} <code>{e['event_code']}</code> — <b>{e['title']}</b> ({cnt} ishtirokchi)\n"
-        buttons.append([InlineKeyboardButton(
-            text=f"{status_icon} {e['event_code']} — {e['title'][:24]}",
-            callback_data=f"admin_volunteer_event_detail_{e['id']}"
-        )])
-    buttons.append([InlineKeyboardButton(text="➕ Tadbir yaratish", callback_data="admin_volunteer_create_event")])
-    buttons.append([InlineKeyboardButton(text="⬅ Volontyorlik bo'limi", callback_data="admin_volunteer_menu")])
-    await safe_edit(callback.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    await callback.answer()
-
-
-async def _render_volunteer_event_detail(callback: CallbackQuery, event_id: int):
-    event = db.get_volunteer_event(event_id)
-    if not event:
-        await callback.answer("Tadbir topilmadi!", show_alert=True); return
-    cnt = db.get_volunteer_participant_count(event_id)
-    mode_label = "🔓 Ochiq (ID bilsa yetarli)" if event["open_mode"] else "🔒 Ro'yxat asosida"
-    status_label = "✅ Faol" if event["is_active"] else "⏸ Pauzada (sertifikat berilmaydi)"
-    has_own_template = os.path.exists(volunteer_event_template_path(event_id))
-    template_label = "✅ Shaxsiy shablon yuklangan" if has_own_template else "— Umumiy shablon ishlatiladi"
-
-    text = (
-        f"📋 <b>{event['title']}</b>\n{'─' * 30}\n"
-        f"🆔 ID: <code>{event['event_code']}</code>\n"
-        f"⚙️ Turi: {mode_label}\n"
-        f"📊 Holat: {status_label}\n"
-        f"👥 Ishtirokchilar: <b>{cnt}</b>\n"
-        f"🖼 Sertifikat shabloni: {template_label}"
-    )
-    toggle_text = "⏸ Pauza qilish" if event["is_active"] else "▶️ Faollashtirish"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📤 Qatnashchilar yuklash", callback_data=f"admin_volunteer_upload_{event_id}"),
-            InlineKeyboardButton(text="📥 Excel eksport", callback_data=f"admin_volunteer_export_{event_id}"),
-        ],
-        [InlineKeyboardButton(text="🖼 Shu tadbir uchun shablon", callback_data=f"admin_volunteer_event_template_{event_id}")],
-        [
-            InlineKeyboardButton(text=toggle_text, callback_data=f"admin_volunteer_toggle_{event_id}"),
-            InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"admin_volunteer_delete_{event_id}"),
-        ],
-        [InlineKeyboardButton(text="⬅ Tadbirlar ro'yxati", callback_data="admin_volunteer_events_list")],
-    ])
-    await safe_edit(callback.message, text, reply_markup=kb)
-
-
-@router.callback_query(F.data.startswith("admin_volunteer_event_detail_"))
-async def admin_volunteer_event_detail(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    event_id = int(callback.data.split("_")[4])
-    await _render_volunteer_event_detail(callback, event_id)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("admin_volunteer_toggle_"))
-async def admin_volunteer_toggle(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    event_id = int(callback.data.split("_")[3])
-    event = db.get_volunteer_event(event_id)
-    if not event:
-        await callback.answer("Tadbir topilmadi!", show_alert=True); return
-    db.set_volunteer_event_active(event_id, not event["is_active"])
-    msg = "⏸ Pauza qilindi!" if event["is_active"] else "▶️ Faollashtirildi!"
-    await callback.answer(msg, show_alert=True)
-    await _render_volunteer_event_detail(callback, event_id)
-
-
-@router.callback_query(F.data.startswith("admin_volunteer_delete_"))
-async def admin_volunteer_delete_ask(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    event_id = int(callback.data.split("_")[3])
-    event = db.get_volunteer_event(event_id)
-    if not event:
-        await callback.answer("Tadbir topilmadi!", show_alert=True); return
-    cnt = db.get_volunteer_participant_count(event_id)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"admin_volunteer_confirm_delete_{event_id}"),
-        InlineKeyboardButton(text="❌ Bekor", callback_data=f"admin_volunteer_event_detail_{event_id}"),
-    ]])
-    await safe_edit(
-        callback.message,
-        f"⚠️ <b>'{event['title']}'</b> o'chirilsinmi?\n\n"
-        f"Bu tadbirning {cnt} ta ishtirokchisi ro'yxati ham butunlay o'chib ketadi!",
-        reply_markup=kb
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("admin_volunteer_confirm_delete_"))
-async def admin_volunteer_delete_do(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    event_id = int(callback.data.split("_")[4])
-    db.delete_volunteer_event(event_id)
-    await callback.answer("✅ O'chirildi!", show_alert=True)
-    await admin_volunteer_events_list(callback)
-
-
-@router.callback_query(F.data.startswith("admin_volunteer_event_template_"))
-async def admin_volunteer_event_template_start(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    event_id = int(callback.data.split("_")[4])
-    event = db.get_volunteer_event(event_id)
-    if not event:
-        await callback.answer("Tadbir topilmadi!", show_alert=True); return
-    await state.update_data(vol_template_event_id=event_id)
-    await state.set_state(VolunteerState.waiting_event_template)
-    await callback.message.answer(
-        f"🖼 <b>'{event['title']}'</b> uchun sertifikat shablonini rasm ko'rinishida yuboring.\n\n"
-        "<i>Bu faqat shu tadbir uchun ishlatiladi. Yuklamasangiz, umumiy volontyorlik "
-        "shabloni ishlatiladi. Koordinatalar o'zgarmaydi.</i>",
-        reply_markup=cancel_kb, parse_mode=ParseMode.HTML
-    )
-    await callback.answer()
-
-
-@router.message(VolunteerState.waiting_event_template, F.photo, F.chat.type == "private")
-async def admin_volunteer_event_template_save(message: Message, state: FSMContext, bot: Bot):
-    if not is_admin(message.from_user.id): return
-    data = await state.get_data()
-    event_id = data.get("vol_template_event_id")
-    path = volunteer_event_template_path(event_id)
-    file = await bot.get_file(message.photo[-1].file_id)
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    await bot.download_file(file.file_path, destination=path)
-    await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅ Tadbirga qaytish", callback_data=f"admin_volunteer_event_detail_{event_id}")]
-    ])
-    await message.answer("✅ Shu tadbir uchun shaxsiy sertifikat shabloni yuklandi!", reply_markup=kb)
-
-
-@router.message(VolunteerState.waiting_event_template, F.chat.type == "private")
-async def admin_volunteer_event_template_invalid(message: Message, state: FSMContext):
-    if message.text == "❌ Bekor qilish":
-        await state.clear(); await message.answer("Bekor.", reply_markup=main_menu); return
-    await message.answer("❗ Iltimos, rasm (foto) ko'rinishida yuboring.")
-
-
-@router.callback_query(F.data.startswith("admin_volunteer_upload_"))
-async def admin_volunteer_upload_start(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    event_id = int(callback.data.split("_")[3])
-    event = db.get_volunteer_event(event_id)
-    if not event:
-        await callback.answer("Tadbir topilmadi!", show_alert=True); return
-    await state.update_data(vol_event_id=event_id)
-    await state.set_state(VolunteerState.waiting_participants_file)
-    await callback.message.answer(
-        f"📤 <b>'{event['title']}'</b> uchun tasdiqlangan ishtirokchilar ro'yxatini yuboring.\n\n"
-        "Excel ustunlari (1-qator sarlavha):\n<b>F.I.O | Telefon | Telegram ID</b>\n\n"
-        "<i>Telefon va Telegram ID — ikkalasi ham ixtiyoriy, lekin kamida bittasi to'ldirilishi kerak. "
-        "Telegram ID kiritilsa, u to'g'ridan-to'g'ri ishlatiladi; bo'sh bo'lsa, telefon raqami "
-        "bo'yicha avtomatik qidiriladi.</i>",
-        reply_markup=cancel_kb, parse_mode=ParseMode.HTML
-    )
-    await callback.answer()
-
-
-@router.message(VolunteerState.waiting_participants_file, F.document, F.chat.type == "private")
-async def admin_volunteer_upload_file(message: Message, state: FSMContext, bot: Bot):
-    if not is_admin(message.from_user.id): return
-    data = await state.get_data()
-    event_id = data.get("vol_event_id")
-
-    file = await bot.get_file(message.document.file_id)
-    buf = io.BytesIO()
-    await bot.download_file(file.file_path, destination=buf)
-    buf.seek(0)
-    try:
-        wb = openpyxl.load_workbook(buf)
-        ws = wb.active
-    except Exception:
-        await message.answer("❗ Fayl noto'g'ri formatda. Qaytadan .xlsx yuboring."); return
-
-    rows, matched, unmatched = [], 0, 0
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if not row or not row[0]:
-            continue
-        full_name = str(row[0]).strip()
-        phone = str(row[1]).strip() if len(row) > 1 and row[1] else ""
-        raw_tg_id = row[2] if len(row) > 2 else None
-
-        user_id = None
-        if raw_tg_id not in (None, ""):
-            try:
-                user_id = int(raw_tg_id)
-            except (ValueError, TypeError):
-                user_id = None
-        if user_id is None and phone:
-            user_id = db.find_user_id_by_phone(phone)
-
-        if user_id:
-            matched += 1
-        else:
-            unmatched += 1
-        rows.append({"full_name": full_name, "phone": phone, "user_id": user_id})
-
-    await state.clear()
-    if not rows:
-        await message.answer("❗ Faylda hech qanday to'g'ri qator topilmadi.", reply_markup=main_menu); return
-
-    added = db.add_volunteer_participants(event_id, rows)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅ Tadbirga qaytish", callback_data=f"admin_volunteer_event_detail_{event_id}")],
-    ])
-    report = (
-        f"✅ <b>Yuklandi!</b>\n\n"
-        f"➕ Qo'shildi: <b>{added}</b> ta\n"
-        f"✅ Telegram bilan bog'landi: <b>{matched}</b> ta\n"
-        f"⚠️ Bog'lanmadi: <b>{unmatched}</b> ta"
-    )
-    unmatched_rows = [r for r in rows if not r.get("user_id")]
-    if unmatched_rows:
-        report += "\n\n⚠️ <b>Bog'lanmaganlar</b> (F.I.O — telefon):\n"
-        for r in unmatched_rows[:15]:
-            report += f"  • {r['full_name']} — {r['phone'] or '—'}\n"
-        if len(unmatched_rows) > 15:
-            report += f"  ... yana {len(unmatched_rows) - 15} ta\n"
-        report += (
-            "\n<i>Sabab: telefon raqami botga hech qachon yuborilmagan yoki noto'g'ri formatda. "
-            "Telegram ID ustunini to'ldirib qayta yuklashingiz mumkin.</i>"
-        )
-    await message.answer(report, reply_markup=kb, parse_mode=ParseMode.HTML)
-
-
-@router.message(VolunteerState.waiting_participants_file, F.chat.type == "private")
-async def admin_volunteer_upload_invalid(message: Message, state: FSMContext):
-    if message.text == "❌ Bekor qilish":
-        await state.clear(); await message.answer("Bekor.", reply_markup=main_menu); return
-    await message.answer("❗ Iltimos, .xlsx fayl yuboring (hujjat ko'rinishida).")
-
-
-@router.callback_query(F.data.startswith("admin_volunteer_export_"))
-async def admin_volunteer_export(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    event_id = int(callback.data.split("_")[3])
-    event = db.get_volunteer_event(event_id)
-    if not event:
-        await callback.answer("Tadbir topilmadi!", show_alert=True); return
-    await callback.answer("⏳ Excel tayyorlanmoqda...")
-
-    participants = db.get_volunteer_participants(event_id)
-    if not participants:
-        await callback.message.answer("📭 Hali ishtirokchilar yo'q."); return
-
-    from openpyxl.styles import Font, Alignment
-    from openpyxl.utils import get_column_letter
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = f"Tadbir {event_id}"[:31]
-    headers = ["#", "F.I.O", "Telefon", "Telegram ID", "Sertifikat olgan", "Sertifikat kodi", "Berilgan sana"]
-    ws.append(headers)
-    bold_font = Font(bold=True)
-    for cell in ws[1]:
-        cell.font = bold_font
-        cell.alignment = Alignment(horizontal="center")
-    for i, p in enumerate(participants, start=1):
-        ws.append([
-            i, p["full_name"] or "", p["phone"] or "", p["user_id"] or "",
-            "Ha" if p["cert_issued"] else "Yo'q", p["cert_code"] or "",
-            (p["issued_at"] or "")[:16]
-        ])
-    widths = [5, 28, 16, 14, 14, 16, 18]
-    for col_idx, width in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    filename = f"tadbir_{event_id}_ishtirokchilar_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-    await callback.message.answer_document(
-        BufferedInputFile(buf.read(), filename=filename),
-        caption=f"📋 <b>{event['title']}</b>\n\n👥 Jami: <b>{len(participants)}</b> ta ishtirokchi",
-        parse_mode=ParseMode.HTML
-    )
-
-
-# ── BROADCAST ─────────────────────────────────────────────────────────────────
-def _broadcast_target_ids(target: str) -> list:
-    if target == "front":
-        return [row["user_id"] for row in db.get_all_front_members() if row["user_id"]]
-    return [row["id"] for row in db.get_all_users()]
-
-
-def _broadcast_target_label(target: str) -> str:
-    return "🏢 Front ofis a'zolari" if target == "front" else "👥 Barcha foydalanuvchilar"
-
-
-@router.callback_query(F.data == "admin_broadcast")
-async def admin_broadcast_start(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    all_count = db.get_user_count()
-    front_count = db.get_front_member_count()
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"👥 Barcha foydalanuvchilar ({all_count})", callback_data="admin_bc_target_all")],
-        [InlineKeyboardButton(text=f"🏢 Front ofis a'zolari ({front_count})", callback_data="admin_bc_target_front")],
-        [InlineKeyboardButton(text="⬅️ Admin", callback_data="admin_back")],
-    ])
-    await safe_edit(
-        callback.message,
-        "📢 <b>BROADCAST</b>\n\nXabarni kimlarga yubormoqchisiz?",
-        reply_markup=kb
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("admin_bc_target_"))
-async def admin_broadcast_target(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    target = callback.data.split("_")[3]  # "all" | "front"
-    await state.update_data(bc_target=target)
-    await state.set_state(BroadcastState.waiting_content)
-    await callback.message.answer(
-        f"✉️ <b>{_broadcast_target_label(target)}</b> ga yuborish uchun xabarni yuboring.\n\n"
-        "Matn, rasm, hujjat — istalgan turdagi xabar bo'lishi mumkin "
-        "(masalan, Google Forma havolasi).",
-        reply_markup=cancel_kb, parse_mode=ParseMode.HTML
-    )
-    await callback.answer()
-
-
-@router.message(BroadcastState.waiting_content, F.chat.type == "private")
-async def admin_broadcast_content(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    if message.text == "❌ Bekor qilish":
-        await state.clear(); await message.answer("Bekor.", reply_markup=main_menu); return
-
-    data = await state.get_data()
-    target = data.get("bc_target", "all")
-    recipients = _broadcast_target_ids(target)
-    await state.update_data(bc_chat_id=message.chat.id, bc_message_id=message.message_id)
-    await state.set_state(BroadcastState.confirming)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Yuborish", callback_data="admin_bc_confirm")],
-        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin_bc_cancel")],
-    ])
-    await message.answer(
-        f"📢 <b>{_broadcast_target_label(target)}</b>\n"
-        f"👥 Qabul qiluvchilar: <b>{len(recipients)}</b> ta\n\n"
-        f"Yuqoridagi xabar shu qabul qiluvchilarga yuborilsinmi?",
-        reply_markup=kb, parse_mode=ParseMode.HTML
-    )
-
-
-@router.callback_query(F.data == "admin_bc_cancel", BroadcastState.confirming)
-async def admin_broadcast_cancel(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text("❌ Broadcast bekor qilindi.")
-    await callback.answer()
-
-
-@router.callback_query(F.data == "admin_bc_confirm", BroadcastState.confirming)
-async def admin_broadcast_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    data = await state.get_data()
-    target = data.get("bc_target", "all")
-    src_chat_id = data.get("bc_chat_id")
-    src_message_id = data.get("bc_message_id")
-    recipients = _broadcast_target_ids(target)
-    await state.clear()
-    await callback.answer()
-    status_msg = await callback.message.edit_text(f"⏳ Yuborilmoqda... 0/{len(recipients)}")
-
-    sent, failed = 0, 0
-    for i, uid in enumerate(recipients, start=1):
-        try:
-            await bot.copy_message(chat_id=uid, from_chat_id=src_chat_id, message_id=src_message_id)
-            sent += 1
-        except TelegramForbiddenError:
-            failed += 1
-        except Exception as e:
-            failed += 1
-            logging.warning(f"Broadcast xatosi ({uid}): {e}")
-        await asyncio.sleep(0.05)
-        if i % 25 == 0 or i == len(recipients):
-            try:
-                await status_msg.edit_text(f"⏳ Yuborilmoqda... {i}/{len(recipients)}")
-            except Exception:
-                pass
-
-    db.log_broadcast(callback.from_user.id, f"[{target}] message_id={src_message_id}", sent, failed)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Admin", callback_data="admin_back")]])
-    await status_msg.edit_text(
-        f"✅ <b>Broadcast yakunlandi!</b>\n\n"
-        f"📤 Yuborildi: <b>{sent}</b>\n"
-        f"⛔ Yuborilmadi: <b>{failed}</b>",
-        reply_markup=kb, parse_mode=ParseMode.HTML
     )
 
 
@@ -4063,260 +2564,6 @@ async def admin_confirm_delete(callback: CallbackQuery):
     await admin_tests_list(callback)
 
 
-# ── TEST TAHRIRLASH ──────────────────────────────────────────────────────────
-_EDIT_FIELDS = {
-    "title": "Nomi",
-    "description": "Tavsif",
-    "time_limit": "Vaqt (daqiqa)",
-    "question_count": "Ko'rsatiladigan savollar soni",
-    "max_attempts": "Maksimal urinishlar soni",
-}
-
-
-@router.callback_query(F.data.startswith("admin_edit_"))
-async def admin_edit_test_start(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    test_id = int(callback.data.split("_")[2])
-    test = db.get_test(test_id)
-    if not test:
-        await callback.answer("Test topilmadi!", show_alert=True); return
-    await state.update_data(edit_test_id=test_id)
-    buttons = [
-        [InlineKeyboardButton(text=label, callback_data=f"admin_editfield_{test_id}_{key}")]
-        for key, label in _EDIT_FIELDS.items()
-    ]
-    buttons.append([InlineKeyboardButton(text="⬅Orqaga", callback_data=f"admin_test_detail_{test_id}")])
-    await callback.message.edit_text(
-        f"✏️ <b>'{test['title']}'</b>\n\nQaysi maydonni tahrirlaysiz?",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode=ParseMode.HTML
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("admin_editfield_"))
-async def admin_edit_field_start(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    _, _, test_id_str, field = callback.data.split("_", 3)
-    test_id = int(test_id_str)
-    if field not in _EDIT_FIELDS:
-        await callback.answer("Noma'lum maydon!", show_alert=True); return
-    await state.update_data(edit_test_id=test_id, edit_field=field)
-    await state.set_state(AdminTestState.editing_value)
-    await callback.message.edit_text(
-        f"✏️ <b>{_EDIT_FIELDS[field]}</b> uchun yangi qiymatni kiriting:",
-        parse_mode=ParseMode.HTML
-    )
-    await callback.answer()
-
-
-@router.message(AdminTestState.editing_value, F.chat.type == "private")
-async def admin_edit_field_save(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    data = await state.get_data()
-    test_id = data.get("edit_test_id")
-    field = data.get("edit_field")
-    test = db.get_test(test_id)
-    if not test:
-        await state.clear(); await message.answer("Test topilmadi!", reply_markup=main_menu); return
-
-    values = {
-        "title": test["title"], "description": test["description"],
-        "time_limit": test["time_limit"], "question_count": test["question_count"],
-        "max_attempts": test["max_attempts"],
-    }
-    raw = message.text.strip()
-    try:
-        if field in ("time_limit", "question_count", "max_attempts"):
-            values[field] = int(raw)
-        else:
-            values[field] = raw
-    except ValueError:
-        await message.answer("❗ Raqam kiriting!"); return
-
-    db.update_test(
-        test_id, values["title"], values["description"],
-        values["time_limit"], values["question_count"], values["max_attempts"]
-    )
-    await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅ Testga qaytish", callback_data=f"admin_test_detail_{test_id}")]
-    ])
-    await message.answer("✅ Yangilandi!", reply_markup=kb)
-
-
-# ── SAVOL QO'LDA QO'SHISH ─────────────────────────────────────────────────────
-@router.callback_query(F.data.startswith("admin_add_q_"))
-async def admin_add_q_start(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    test_id = int(callback.data.split("_")[3])
-    await state.update_data(q_test_id=test_id)
-    await state.set_state(AdminTestState.adding_q_text)
-    await callback.message.answer("📝 Savol matnini kiriting:", reply_markup=cancel_kb)
-    await callback.answer()
-
-
-@router.message(AdminTestState.adding_q_text, F.chat.type == "private")
-async def aq_text(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    if message.text == "❌ Bekor qilish":
-        await state.clear(); await message.answer("Bekor.", reply_markup=main_menu); return
-    await state.update_data(q_text=message.text)
-    await state.set_state(AdminTestState.adding_q_a)
-    await message.answer("A) variantini kiriting:", reply_markup=cancel_kb)
-
-
-@router.message(AdminTestState.adding_q_a, F.chat.type == "private")
-async def aq_a(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    if message.text == "❌ Bekor qilish":
-        await state.clear(); await message.answer("Bekor.", reply_markup=main_menu); return
-    await state.update_data(q_a=message.text)
-    await state.set_state(AdminTestState.adding_q_b)
-    await message.answer("B) variantini kiriting:", reply_markup=cancel_kb)
-
-
-@router.message(AdminTestState.adding_q_b, F.chat.type == "private")
-async def aq_b(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    if message.text == "❌ Bekor qilish":
-        await state.clear(); await message.answer("Bekor.", reply_markup=main_menu); return
-    await state.update_data(q_b=message.text)
-    await state.set_state(AdminTestState.adding_q_c)
-    await message.answer("C) variantini kiriting:", reply_markup=cancel_kb)
-
-
-@router.message(AdminTestState.adding_q_c, F.chat.type == "private")
-async def aq_c(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    if message.text == "❌ Bekor qilish":
-        await state.clear(); await message.answer("Bekor.", reply_markup=main_menu); return
-    await state.update_data(q_c=message.text)
-    await state.set_state(AdminTestState.adding_q_d)
-    await message.answer("D) variantini kiriting:", reply_markup=cancel_kb)
-
-
-@router.message(AdminTestState.adding_q_d, F.chat.type == "private")
-async def aq_d(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    if message.text == "❌ Bekor qilish":
-        await state.clear(); await message.answer("Bekor.", reply_markup=main_menu); return
-    await state.update_data(q_d=message.text)
-    await state.set_state(AdminTestState.adding_q_correct)
-    await message.answer("To'g'ri javobni kiriting (A, B, C yoki D):", reply_markup=cancel_kb)
-
-
-@router.message(AdminTestState.adding_q_correct, F.chat.type == "private")
-async def aq_correct(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
-    if message.text == "❌ Bekor qilish":
-        await state.clear(); await message.answer("Bekor.", reply_markup=main_menu); return
-    correct = message.text.strip().upper()
-    if correct not in ("A", "B", "C", "D"):
-        await message.answer("❗ Faqat A, B, C yoki D kiriting:"); return
-
-    data = await state.get_data()
-    test_id = data.get("q_test_id")
-    db.add_question(test_id, data["q_text"], data["q_a"], data["q_b"], data["q_c"], data["q_d"], correct)
-    await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Yana savol qo'shish", callback_data=f"admin_add_q_{test_id}")],
-        [InlineKeyboardButton(text="⬅ Testga qaytish", callback_data=f"admin_test_detail_{test_id}")]
-    ])
-    await message.answer("✅ Savol qo'shildi!", reply_markup=kb)
-
-
-# ── SAVOLLARNI EXCEL ORQALI YUKLASH ──────────────────────────────────────────
-@router.callback_query(F.data.startswith("admin_excel_"))
-async def admin_excel_start(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    test_id = int(callback.data.split("_")[2])
-    await state.update_data(excel_test_id=test_id)
-    await state.set_state(AdminTestState.waiting_excel)
-    await callback.message.answer(
-        "📥 <b>Excel fayl yuboring.</b>\n\n"
-        "Ustunlar tartibi (1-qator sarlavha, 2-qatordan boshlab ma'lumot):\n"
-        "<b>Savol | A | B | C | D | To'g'ri javob (A/B/C/D)</b>",
-        reply_markup=cancel_kb, parse_mode=ParseMode.HTML
-    )
-    await callback.answer()
-
-
-@router.message(AdminTestState.waiting_excel, F.document, F.chat.type == "private")
-async def admin_excel_upload(message: Message, state: FSMContext, bot: Bot):
-    if not is_admin(message.from_user.id): return
-    data = await state.get_data()
-    test_id = data.get("excel_test_id")
-
-    file = await bot.get_file(message.document.file_id)
-    buf = io.BytesIO()
-    await bot.download_file(file.file_path, destination=buf)
-    buf.seek(0)
-
-    try:
-        wb = openpyxl.load_workbook(buf)
-        ws = wb.active
-    except Exception:
-        await message.answer("❗ Fayl noto'g'ri formatda. Qaytadan .xlsx yuboring."); return
-
-    added, skipped = 0, 0
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if not row or not row[0]:
-            continue
-        try:
-            q_text, a, b, c, d, correct = row[0], row[1], row[2], row[3], row[4], row[5]
-            correct = str(correct).strip().upper()
-            if correct not in ("A", "B", "C", "D") or not all([q_text, a, b, c, d]):
-                skipped += 1; continue
-            db.add_question(test_id, str(q_text), str(a), str(b), str(c), str(d), correct)
-            added += 1
-        except Exception:
-            skipped += 1
-
-    await state.clear()
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅ Testga qaytish", callback_data=f"admin_test_detail_{test_id}")]
-    ])
-    await message.answer(
-        f"✅ <b>Yuklandi!</b>\n\n➕ Qo'shildi: <b>{added}</b> ta\n"
-        f"⛔ O'tkazib yuborildi: <b>{skipped}</b> ta",
-        reply_markup=kb, parse_mode=ParseMode.HTML
-    )
-
-
-@router.message(AdminTestState.waiting_excel, F.chat.type == "private")
-async def admin_excel_invalid(message: Message):
-    if message.text == "❌ Bekor qilish":
-        return
-    await message.answer("❗ Iltimos, .xlsx fayl yuboring (hujjat ko'rinishida).")
-
-
-# ── TEST BO'YICHA NATIJALAR ───────────────────────────────────────────────────
-@router.callback_query(F.data.startswith("admin_test_results_"))
-async def admin_test_results(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("❌ Ruxsat yo'q!", show_alert=True); return
-    test_id = int(callback.data.split("_")[3])
-    test = db.get_test(test_id)
-    results = db.get_results(test_id=test_id, limit=30)
-    text = f"📊 <b>'{test['title']}' natijalari</b>\n{'─' * 30}\n\n"
-    if not results:
-        text += "📭 Hali natijalar yo'q."
-    else:
-        for r in results:
-            status = "✅" if r["passed"] else "❌"
-            pct = round(r["score"] / r["total"] * 100) if r["total"] else 0
-            text += f"{status} {r['user_name'] or r['user_id']} — {r['score']}/{r['total']} ({pct}%)\n"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅ Testga qaytish", callback_data=f"admin_test_detail_{test_id}")]
-    ])
-    await safe_edit(callback.message, text, reply_markup=kb)
-    await callback.answer()
-
-
 @router.callback_query(F.data == "admin_create_test")
 async def admin_create_test_start(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
@@ -4438,6 +2685,16 @@ async def process_passport(message: Message, state: FSMContext):
         "<i>Bu parolni test yechishda kiritasiz.</i>",
         reply_markup=cancel_kb, parse_mode=ParseMode.HTML
     )
+
+
+@router.message(AdminTestState.adding_q_a, F.chat.type == "private")
+async def aq_a(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    if message.text == "❌ Bekor qilish":
+        await state.clear(); await message.answer("Bekor.", reply_markup=main_menu); return
+    await state.update_data(q_a=message.text)
+    await state.set_state(AdminTestState.adding_q_b)
+    await message.answer("B) variantini kiriting:", reply_markup=cancel_kb)
 
 
 @router.message(TestTakingState.taking_test, F.chat.type == "private")
@@ -4634,12 +2891,6 @@ def _front_region_kb() -> InlineKeyboardMarkup:
 @router.message(F.text == "🏢 Front ofis a'zoligiga ariza", F.chat.type == "private")
 async def front_apply_start(message: Message, state: FSMContext):
     await state.clear()
-    if not FRONT_REGISTRATION_OPEN:
-        await message.answer(
-            FRONT_REGISTRATION_CLOSED_MSG,
-            reply_markup=main_menu, parse_mode=ParseMode.HTML
-        )
-        return
     if db.is_front_member(message.from_user.id):
         await message.answer(
             "✅ Siz allaqachon front ofis a'zoligiga ariza topshirgansiz!\n\n"
@@ -5016,7 +3267,6 @@ async def _guv_load_record(state: FSMContext, uid: int, rec):
         region_code=code,
         position=guv_norm_text(rec["position"]) if rec["position"] else None,
         phone=rec["phone"],
-        card_no=_row_get(rec, "card_no"),
     )
 
 
@@ -5073,9 +3323,7 @@ async def _guv_issue(message: Message, state: FSMContext, bot: Bot):
     code = d["region_code"]
     region = GUV_REGION_NAME.get(code, "")
     position = d.get("position") or f"{region} koordinatori"
-    # ID: Excel'dagi raqam → bo'lmasa Telegram ID oxirgi 4 raqami → tasodifiy
-    card_id, id_src = guv_resolve_card_id(code, d.get("card_no"), uid)
-    logging.info(f"[GUV] ID={card_id} (manba: {id_src}) uid={uid}")
+    card_id = guv_make_card_id(code)
 
     db.save_membership_card(
         card_id=card_id, user_id=uid,
@@ -5223,20 +3471,14 @@ async def guv_photo_invalid(message: Message, state: FSMContext):
 # A'ZOLIK GUVOHNOMASI — ADMIN
 # =============================================================================
 _GUV_COL_MAP = [
-    # Diqqat: tartib muhim — "Telegram ID" ustuni card_no bilan aralashmasligi
-    # uchun card_no kalitlari aniq ("id raqam"), tg_id esa "telegram" bilan
-    # aniqlanadi va ro'yxatda keyin turadi.
     ("middle_name", ("otasining", "otasi", "sharif", "otchestvo", "middle")),
     ("last_name",   ("familiya", "familya", "surname", "last name", "familiyasi")),
-    ("card_no",     ("id raqami", "id raqam", "guvohnoma id", "guvohnoma raqam",
-                     "karta id", "karta raqam", "card id", "card no")),
     ("first_name",  ("ismi", "ism", "name", "imya")),
-    ("tg_id",       ("telegram", "tg id", "tgid", "chat id", "user id")),
+    ("tg_id",       ("telegram", "tg id", "tgid", "chat id", "user id", "id raqam")),
     ("phone",       ("telefon", "phone", "raqam", "nomer", "tel")),
     ("region",      ("hudud", "viloyat", "region", "shahar")),
     ("position",    ("lavozim", "position", "vazifa")),
 ]
-# Sarlavhasiz (eski) fayllar uchun zaxira tartib — o'zgartirilmaydi
 _GUV_DEFAULT_ORDER = ["last_name", "first_name", "middle_name",
                       "tg_id", "phone", "region", "position"]
 
@@ -5300,21 +3542,16 @@ async def admin_guv_sample(callback: CallbackQuery):
     from openpyxl.styles import Font, Alignment
     from openpyxl.utils import get_column_letter
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "A'zolar"
-    headers = ["Familiyasi", "Ismi", "Otasining ismi", "ID raqami (4 xona)",
-               "Telegram ID", "Telefon", "Hudud", "Lavozim (ixtiyoriy)"]
+    headers = ["Familiyasi", "Ismi", "Otasining ismi", "Telegram ID",
+               "Telefon", "Hudud", "Lavozim (ixtiyoriy)"]
     ws.append(headers)
     for c in ws[1]:
         c.font = Font(bold=True); c.alignment = Alignment(horizontal="center")
-    ws.append(["Bahodirov", "Baxtiyorjon", "Abdulaziz o'g'li", "0125",
+    ws.append(["Bahodirov", "Baxtiyorjon", "Abdulaziz o'g'li",
                2110945697, "+998901234567", "Toshkent shahri", ""])
-    ws.append(["Karimova", "Nilufar", "Akmal qizi", "",
+    ws.append(["Karimova", "Nilufar", "Akmal qizi",
                "", "+998935556677", "Farg'ona", "Farg'ona viloyati koordinatori"])
-    ws.append(["Toshev", "Aziz", "Rustam o'g'li", "",
-               1924892484, "+998901112233", "Andijon", ""])
-    # ID ustuni matn formatida bo'lsin — 0 bilan boshlangan raqam yo'qolmasligi uchun
-    for r in range(2, ws.max_row + 1):
-        ws.cell(row=r, column=4).number_format = "@"
-    for i, w in enumerate([20, 18, 22, 18, 16, 18, 22, 30], start=1):
+    for i, w in enumerate([20, 18, 22, 16, 18, 22, 30], start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
 
@@ -5323,13 +3560,7 @@ async def admin_guv_sample(callback: CallbackQuery):
         caption=(
             "📄 <b>A'zolar ro'yxati namunasi</b>\n\n"
             "• <b>Telegram ID</b> yoki <b>Telefon</b> — kamida bittasi bo'lishi shart\n"
-            "• <b>Hudud</b> ID raqamning birinchi 2 raqamini belgilaydi "
-            "(Toshkent sh. → <code>01</code>)\n"
-            "• <b>ID raqami (4 xona)</b> — guvohnoma ID sining oxirgi 4 raqami.\n"
-            "   ‣ To'ldirilsa — aynan shu raqam beriladi (<code>01</code>+<code>0125</code> "
-            "→ <code>010125</code>)\n"
-            "   ‣ Bo'sh qoldirilsa — <b>Telegram ID sining oxirgi 4 raqami</b> olinadi\n"
-            "   ‣ Takroriy ID bo'lsa — o'sha qator yuklanmaydi va ro'yxati ko'rsatiladi\n"
+            "• <b>Hudud</b> ID raqamning birinchi 2 raqamini belgilaydi\n"
             "• <b>Lavozim</b> bo'sh bo'lsa — «&lt;Hudud&gt; koordinatori» yoziladi\n\n"
             "Shu ustunlarni to'ldirib, «📥 Ro'yxatni yuklash» orqali yuboring."
         ),
@@ -5345,11 +3576,9 @@ async def admin_guv_upload_start(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         "📥 <b>A'zolar ro'yxatini yuklash</b>\n\n"
         "Excel faylni (<code>.xlsx</code>) shu yerga yuboring.\n"
-        "Ustunlar: Familiyasi | Ismi | Otasining ismi | ID raqami (4 xona) | "
-        "Telegram ID | Telefon | Hudud | Lavozim\n\n"
-        "• <b>ID raqami</b> bo'sh bo'lsa — Telegram ID sining oxirgi 4 raqami olinadi\n"
-        "• Takroriy ID topilsa — o'sha qator o'tkazib yuboriladi\n"
-        "• Mavjud a'zolar (Telegram ID yoki telefon bo'yicha) yangilanadi.",
+        "Ustunlar: Familiyasi | Ismi | Otasining ismi | Telegram ID | "
+        "Telefon | Hudud | Lavozim\n\n"
+        "Mavjud a'zolar (Telegram ID yoki telefon bo'yicha) yangilanadi.",
         reply_markup=cancel_kb, parse_mode=ParseMode.HTML
     )
     await callback.answer()
@@ -5392,9 +3621,6 @@ async def admin_guv_upload_file(message: Message, state: FSMContext, bot: Bot):
 
     added = updated = skipped = 0
     bad_region = []
-    dup_rows = []          # takroriy ID topilgan qatorlar
-    no_region_id = []      # ID berilgan, lekin hudud tanilmagan qatorlar
-    seen_ids = {}          # shu fayl ichidagi ID lar: full_id -> qator raqami
     for i, r in enumerate(data_rows, start=2):
         vals = {}
         for idx, field in colmap.items():
@@ -5402,12 +3628,9 @@ async def admin_guv_upload_file(message: Message, state: FSMContext, bot: Bot):
 
         tg_id = None
         raw_tg = str(vals.get("tg_id") or "").strip()
-        # Excel raqamni "2110945697.0" ko'rinishida berishi mumkin
-        if raw_tg.endswith(".0"):
-            raw_tg = raw_tg[:-2]
         if raw_tg:
             digits = re.sub(r"\D", "", raw_tg)
-            if digits and len(digits) <= 15:
+            if digits:
                 tg_id = int(digits)
 
         phone = str(vals.get("phone") or "").strip()
@@ -5431,7 +3654,6 @@ async def admin_guv_upload_file(message: Message, state: FSMContext, bot: Bot):
             continue
 
         region_name = None
-        code = None
         if region_raw:
             code = guv_region_code(region_raw)
             if code:
@@ -5439,57 +3661,11 @@ async def admin_guv_upload_file(message: Message, state: FSMContext, bot: Bot):
             else:
                 bad_region.append(f"{i}-qator: «{region_raw}»")
 
-        # ── ID RAQAMI ────────────────────────────────────────────────────────
-        # Excel'dagi ustun to'ldirilgan bo'lsa — o'sha, bo'sh bo'lsa Telegram ID
-        # sining oxirgi 4 raqami olinadi.
-        card_no = guv_card_no(vals.get("card_no"))
-        id_from_tg = False
-        if not card_no and tg_id:
-            card_no = guv_card_no(str(tg_id)[-4:])
-            id_from_tg = True
-
-        fio = " ".join(x for x in [last, first] if x) or "—"
-        if card_no and code:
-            full_id = f"{code}{card_no}"
-            # 1) shu faylning o'zida takrorlanganmi?
-            if full_id in seen_ids:
-                dup_rows.append(
-                    f"{i}-qator: <code>{full_id}</code> — {fio} "
-                    f"(fayl ichida {seen_ids[full_id]}-qator bilan bir xil)")
-                skipped += 1
-                continue
-            # 2) allaqachon berilgan guvohnomada bandmi?
-            issued = db.get_card_by_id(full_id)
-            if issued:
-                owner = " ".join(x for x in [issued["last_name"],
-                                             issued["first_name"]] if x) or "—"
-                dup_rows.append(
-                    f"{i}-qator: <code>{full_id}</code> — {fio} "
-                    f"(guvohnoma allaqachon berilgan: {owner})")
-                skipped += 1
-                continue
-            # 3) ro'yxatdagi boshqa a'zoga band qilinganmi?
-            self_id = db.find_approved_row_id(tg_id, key or None)
-            busy = db.approved_card_no_owner(card_no, region_name, exclude_id=self_id)
-            if busy:
-                owner = " ".join(x for x in [busy["last_name"],
-                                             busy["first_name"]] if x) or "—"
-                src = " (Telegram ID dan olindi)" if id_from_tg else ""
-                dup_rows.append(
-                    f"{i}-qator: <code>{full_id}</code> — {fio}{src} "
-                    f"(ro'yxatda band: {owner})")
-                skipped += 1
-                continue
-            seen_ids[full_id] = i
-        elif card_no and not code:
-            # Hudud tanilmagan — ID keyin, foydalanuvchi hududni tanlaganda beriladi
-            no_region_id.append(f"{i}-qator: {fio} — <code>••{card_no}</code>")
-
         res = db.upsert_approved_member(
             tg_id=tg_id, phone_key=key or None, phone=phone or None,
             last_name=last, first_name=first, middle_name=middle,
             region=region_name, position=position,
-            added_by=message.from_user.id, card_no=card_no
+            added_by=message.from_user.id
         )
         if res == "added":
             added += 1
@@ -5503,27 +3679,13 @@ async def admin_guv_upload_file(message: Message, state: FSMContext, bot: Bot):
         f"⏭ O'tkazib yuborildi: <b>{skipped}</b>\n"
         f"📋 Jami ro'yxatda: <b>{db.get_approved_count()}</b>"
     )
-    if dup_rows:
-        text += ("\n\n🚫 <b>TAKRORIY ID — yuklanmadi</b>\n"
-                 "Quyidagi qatorlardagi ID raqami band. Excel'da tuzatib, "
-                 "faylni qayta yuklang:\n• " + "\n• ".join(dup_rows[:15]))
-        if len(dup_rows) > 15:
-            text += f"\n• ... yana {len(dup_rows) - 15} ta"
     if bad_region:
         text += ("\n\n⚠️ <b>Hudud tanilmadi</b> (bo'sh qoldirildi, "
                  "foydalanuvchidan so'raladi):\n• " + "\n• ".join(bad_region[:10]))
         if len(bad_region) > 10:
             text += f"\n• ... yana {len(bad_region) - 10} ta"
-    if no_region_id:
-        text += ("\n\nℹ️ <b>ID saqlandi, lekin hudud aniqlanmadi</b> — to'liq ID "
-                 "foydalanuvchi hududni tanlaganda shakllanadi (takror bo'lsa "
-                 "avtomatik almashtiriladi):\n• " + "\n• ".join(no_region_id[:10]))
-        if len(no_region_id) > 10:
-            text += f"\n• ... yana {len(no_region_id) - 10} ta"
 
     await wait.delete()
-    if len(text) > 4000:
-        text = text[:3950] + "\n\n… (ro'yxat qisqartirildi)"
     await message.answer(text, reply_markup=main_menu, parse_mode=ParseMode.HTML)
 
 
@@ -5548,24 +3710,16 @@ async def admin_guv_export_list(callback: CallbackQuery):
     from openpyxl.styles import Font, Alignment
     from openpyxl.utils import get_column_letter
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Tasdiqlangan a'zolar"
-    ws.append(["#", "Familiyasi", "Ismi", "Otasining ismi", "ID raqami (4 xona)",
-               "To'liq ID", "Telegram ID", "Telefon", "Hudud", "Lavozim",
-               "Qo'shilgan sana"])
+    ws.append(["#", "Familiyasi", "Ismi", "Otasining ismi", "Telegram ID",
+               "Telefon", "Hudud", "Lavozim", "Qo'shilgan sana"])
     for c in ws[1]:
         c.font = Font(bold=True); c.alignment = Alignment(horizontal="center")
     for i, m in enumerate(rows, start=1):
-        no = _row_get(m, "card_no") or ""
-        rcode = guv_region_code(m["region"]) if m["region"] else None
         ws.append([i, m["last_name"] or "", m["first_name"] or "",
-                   m["middle_name"] or "", no,
-                   f"{rcode}{no}" if (no and rcode) else "",
-                   m["tg_id"] or "", m["phone"] or "",
+                   m["middle_name"] or "", m["tg_id"] or "", m["phone"] or "",
                    m["region"] or "", m["position"] or "",
                    (m["added_at"] or "")[:16]])
-    for r in range(2, ws.max_row + 1):
-        ws.cell(row=r, column=5).number_format = "@"
-        ws.cell(row=r, column=6).number_format = "@"
-    for i, w in enumerate([5, 20, 18, 22, 18, 12, 16, 18, 22, 30, 18], start=1):
+    for i, w in enumerate([5, 20, 18, 22, 16, 18, 22, 30, 18], start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     buf = io.BytesIO(); wb.save(buf); buf.seek(0)
     await callback.message.answer_document(
@@ -5774,50 +3928,6 @@ async def show_admins(message: Message):
         )
     else:
         await message.answer("Bu buyruq faqat adminlar uchun!")
-
-
-# ── VILOYAT GURUHINI SOZLASH ──────────────────────────────────────────────────
-@router.message(F.text.startswith("/set_region"), F.chat.type.in_({"group", "supergroup"}))
-async def set_region_group_cmd(message: Message, bot: Bot):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ Bu buyruqni faqat adminlar ishlata oladi.")
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        await message.answer(
-            "❗ Viloyat nomini ko'rsating, masalan:\n<code>/set_region Andijon</code>\n\n"
-            "Mavjud viloyatlar:\n" + "\n".join(f"• {r}" for r in FRONT_REGIONS),
-            parse_mode=ParseMode.HTML
-        )
-        return
-
-    raw_region = parts[1].strip()
-    matched_region = next((r for r in FRONT_REGIONS if r.lower() == raw_region.lower()), None)
-    if not matched_region:
-        await message.answer(
-            "❗ Bunday viloyat topilmadi. Mavjud viloyatlar:\n" +
-            "\n".join(f"• {r}" for r in FRONT_REGIONS)
-        )
-        return
-
-    try:
-        link = await bot.create_chat_invite_link(chat_id=message.chat.id, name=f"Front ofis - {matched_region}")
-    except Exception as e:
-        await message.answer(
-            "❗ Taklif havolasi yaratib bo'lmadi. Botga ushbu guruhda <b>Admin</b> huquqi va "
-            "<b>\"Foydalanuvchilarni taklif qilish\"</b> ruxsatini bering, so'ng qaytadan urinib ko'ring.\n\n"
-            f"<i>Texnik xato: {e}</i>",
-            parse_mode=ParseMode.HTML
-        )
-        return
-
-    db.set_region_group(
-        matched_region, message.chat.id, message.chat.title or "", link.invite_link, message.from_user.id
-    )
-    await message.answer(
-        f"✅ <b>{matched_region}</b> viloyati ushbu guruhga bog'landi.\n🔗 Taklif havolasi saqlandi.",
-        parse_mode=ParseMode.HTML
-    )
 
 
 
